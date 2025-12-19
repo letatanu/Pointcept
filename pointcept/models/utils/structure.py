@@ -207,3 +207,39 @@ class Point(Dict):
         self["octree"] = octree
         self["octree_order"] = order
         self["octree_inverse"] = inverse
+
+    def apply_permutation(self, perm):
+        """
+        Apply a permutation (or mask) to all per-point tensors in the container.
+        
+        Args:
+            perm (torch.Tensor): A LongTensor of indices or BoolTensor mask with shape (N,).
+                                 Where N is the number of points in the container.
+        
+        Returns:
+            self: Returns the object itself for chaining.
+        """
+        # Determine the number of points N from the permutation tensor
+        N = perm.shape[0]
+        
+        # Identify keys that should be permuted (must be Tensor and have shape (N, ...))
+        keys_to_update = []
+        for key, value in self.items():
+            if isinstance(value, torch.Tensor) and value.shape[0] == N:
+                keys_to_update.append(key)
+        
+        # Apply permutation
+        for key in keys_to_update:
+            self[key] = self[key][perm]
+            
+        # Handle 'sparse' (SparseConvTensor)
+        # Reordering points breaks the alignment between dense coords and sparse indices.
+        # We must remove it so it forces a rebuild (voxelization) in the next layer.
+        if "sparse" in self:
+            del self["sparse"]
+            
+        # Note: 'offset' usually has shape (B,) so it is NOT touched by this loop, which is correct.
+        # However, if 'perm' is a masking operation (removing points), 'offset' would become invalid.
+        # For pure reordering (permutation where len(perm) == N), 'offset' remains valid.
+        
+        return self
