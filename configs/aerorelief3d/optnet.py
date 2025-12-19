@@ -2,7 +2,7 @@ _base_ = ["../_base_/default_runtime.py"]
 
 # Data Configuration
 # ----------------------------------------------------------------------------
-data_root = "data/AeroRelief3D/pcd"
+data_root = "data/AeroRelief3D/pcd_1"
 grid_size = 0.22
 data = dict(
     num_classes=5,
@@ -16,7 +16,7 @@ data = dict(
     ],
     train=dict(
         type="AeroRelief3DDataset",
-        split="train.json",
+        split=["Area_1", "Area_3", "Area_4", "Area_5", "Area_6", "Area_7", "Area_8"],
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
@@ -35,6 +35,11 @@ data = dict(
             dict(type="ChromaticJitter", p=0.95, std=0.05),
             # Voxelization (Grid Sampling) - Key for OPTNet base_grid_size
             dict(type="GridSample", grid_size=grid_size, hash_type="fnv", mode="train", return_grid_coord=True),
+            dict(type="SphereCrop", sample_rate=0.8, mode="random"),
+            dict(type="SphereCrop", point_max=560000, mode="random"),
+            dict(type="CenterShift", apply_z=False),
+            dict(type="NormalizeColor"),
+            
             dict(type="ToTensor"),
             dict(type="Collect", keys=("coord", "grid_coord", "segment"), feat_keys=("coord", "color"))
         ],
@@ -43,11 +48,13 @@ data = dict(
     ),
     val=dict(
         type="AeroRelief3DDataset",
-        split="val.json",
+        split=["Area_2"],
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="GridSample", grid_size=grid_size, hash_type="fnv", mode="train", return_grid_coord=True),
+            dict(type="CenterShift", apply_z=False),
+            dict(type="NormalizeColor"),
             dict(type="ToTensor"),
             dict(type="Collect", keys=("coord", "grid_coord", "segment"), feat_keys=("coord", "color"))
         ],
@@ -55,7 +62,7 @@ data = dict(
     ),
     test=dict(
         type="AeroRelief3DDataset",
-        split="val.json", # or 'test' if labels hidden
+        split=["Area_2"], # or 'test' if labels hidden
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
@@ -66,6 +73,7 @@ data = dict(
             voxelize=dict(type="GridSample", grid_size=grid_size, hash_type="fnv", mode="test", keys=("coord", "color", "segment"), return_grid_coord=True),
             crop=None,
             post_transform=[
+                dict(type="CenterShift", apply_z=False),
                 dict(type="ToTensor"),
                 dict(type="Collect", keys=("coord", "grid_coord", "index"), feat_keys=("coord", "color"))
             ],

@@ -16,16 +16,16 @@ def parse_scene(area, scene_name, dataset_root, output_root):
         # Input: dataset_root/Area_1/pp1.ply
         scene_file_path = os.path.join(dataset_root, area, f"{scene_name}.ply")
         
-        # Output: output_root/Area_1-pp1/
-        save_name = f"{area}-{scene_name}"
-        save_path = os.path.join(output_root, save_name)
+        # --- CHANGED HERE ---
+        # Output: output_root/Area_1/pp1/
+        save_path = os.path.join(output_root, area, scene_name)
         os.makedirs(save_path, exist_ok=True)
 
         if not os.path.exists(scene_file_path):
             print(f"Warning: File not found {scene_file_path}, skipping.")
             return
 
-        print(f"Parsing: {save_name}")
+        print(f"Parsing: {area}/{scene_name}")
 
         # 1. Load Data
         plydata = PlyData.read(scene_file_path)
@@ -41,7 +41,7 @@ def parse_scene(area, scene_name, dataset_root, output_root):
         elif 'r' in properties and 'g' in properties and 'b' in properties:
             colors = np.vstack([vertex_data['r'], vertex_data['g'], vertex_data['b']]).T
         else:
-            print(f"Warning: No color data found in {save_name}, using white.")
+            print(f"Warning: No color data found in {scene_name}, using white.")
             colors = np.ones_like(coords) * 255
 
         # 4. Extract Labels
@@ -56,7 +56,7 @@ def parse_scene(area, scene_name, dataset_root, output_root):
         
         if semantic_gt is None:
             # Fallback: Check if it's stored in the 'alpha' channel or a generic scalar
-            print(f"Warning: Could not identify label property in {save_name}. Found: {properties}")
+            print(f"Warning: Could not identify label property in {scene_name}. Found: {properties}")
             # Assign ignore_index (-1) if no label is found
             semantic_gt = np.zeros(coords.shape[0]) - 1
         

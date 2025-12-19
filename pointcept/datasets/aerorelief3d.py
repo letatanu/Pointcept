@@ -27,7 +27,7 @@ class AeroRelief3DDataset(DefaultDataset):
         "Road",
         "Tree"
     ]
-    VALID_ASSETS = [ "coord", "color" ]
+    VALID_ASSETS = [ "coord", "color", "segment" ]
     def get_data_name(self, idx):
         data_path = self.data_list[idx % len(self.data_list)]
         dir_path, scene_name = os.path.split(data_path)
