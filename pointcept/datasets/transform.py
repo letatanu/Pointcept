@@ -908,6 +908,10 @@ class GridSample(object):
                     displacement = np.sum(
                         displacement * data_dict["normal"], axis=-1, keepdims=True
                     )
+                if np.isnan(displacement).any():
+                    print("WARNING: NaN found in displacement! Replacing with 0.0")
+                    displacement = np.nan_to_num(displacement)
+                    
                 data_dict["displacement"] = displacement[idx_unique]
                 if "displacement" not in data_dict["index_valid_keys"]:
                     data_dict["index_valid_keys"].append("displacement")
@@ -1500,3 +1504,29 @@ class ImgAugmentation(object):
         correspondence[mask] -= np.array(self.crop_start)
         point["correspondence"] = correspondence.reshape(correspondence_shape)
         return point
+
+
+@TRANSFORMS.register_module()
+class ConcatHeightToColor(object):
+    """
+    Appends normalized height (Z) to the color channel.
+    Input Color: (N, 3) -> Output Color: (N, 4)
+    """
+    def __call__(self, data_dict):
+        coord = data_dict["coord"]
+        color = data_dict["color"]
+        
+        # 1. Get Z coordinates (N, 1)
+        z = coord[:, 2:3]
+        
+        # 2. Normalize Z to [0, 1] range
+        # We add 1e-4 to avoid division by zero for completely flat scenes
+        min_z = z.min()
+        max_z = z.max()
+        norm_z = (z - min_z) / (max_z - min_z + 1e-4)
+        
+        # 3. Concatenate to Color
+        # Color becomes 4 channels: [R, G, B, Normalized_Z]
+        data_dict["color"] = np.concatenate([color, norm_z], axis=1)
+        
+        return data_dict

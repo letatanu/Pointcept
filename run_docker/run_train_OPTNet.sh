@@ -13,14 +13,14 @@ DOCKER_IMAGE="letatanu/poincept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="optnet"
-
+EXP_NAME="optnet_context4"
 ## --------------------------------------------------------- ##
 DATASET="aerorelief3d"
 echo "Model Name: $MODEL_NAME"
 echo "Devices: $DEVICES"
 
-docker run --rm -ti \
-  -v /dev/shm:/dev/shm \
+docker run --ulimit nofile=1048576:1048576 --ipc=host \
+  --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
   -v /media/volume/data_cvpr/project/semantic_3d/Pointcept/:/working \
@@ -30,4 +30,4 @@ docker run --rm -ti \
       -p python \
       -d ${DATASET} \
       -c ${MODEL_NAME} \
-      -n ${MODEL_NAME}"
+      -n ${EXP_NAME}"

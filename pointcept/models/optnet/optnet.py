@@ -150,6 +150,84 @@ class PointScorer(nn.Module):
         if x.shape[0] == 0: return torch.zeros(0, device=x.device)
         return self.sigmoid(self.mlp(torch.cat([x, xyz], dim=1))).squeeze(-1)
 
+class ContextGuidedScorer(nn.Module):
+    def __init__(self, in_channels, hidden_dim=64):
+        super().__init__()
+        # Project features + xyz to hidden dimension
+        self.in_proj = nn.Sequential(
+            nn.Linear(in_channels + 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Simple context mixing: Linear projection to generate weights
+        # This acts as a simplified self-attention or gating mechanism
+        self.context_gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        
+        self.out_mlp = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, xyz):
+        if x.shape[0] == 0: return torch.zeros(0, device=x.device)
+        
+        # 1. Fuse feature and geometry
+        feat = self.in_proj(torch.cat([x, xyz], dim=1))
+        
+        # 2. Context Gating (Learns which features are important for ordering)
+        # In a full graph implementation, this would aggregate neighbors.
+        # Here we use a gating mechanism to simulate context importance.
+        gate = self.context_gate(feat)
+        feat_guided = feat * gate
+        
+        # 3. Predict Score
+        return self.sigmoid(self.out_mlp(feat_guided)).squeeze(-1)
+
+class GatedGeometryEmbedding(nn.Module):
+    def __init__(self, in_channels, embed_dim, hidden_dim=32):
+        super().__init__()
+        # 1. The "Multiplier" (Gate): Learns which coordinate axes matter
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, in_channels), # Output size matches input for multiplication
+            nn.Sigmoid() # Force values between 0 and 1 (Gate)
+        )
+        
+        # 2. The "Bias" (Term 2): Learns a transformation of the geometry
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, in_channels)
+        )
+        
+        # 3. The Final Projection (enc_mlp)
+        self.enc_mlp = nn.Sequential(
+            nn.Linear(in_channels, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # x is Displacement (N, 3)
+        
+        # Calculate eFPT-style terms
+        multiplier = self.gate_mlp(x)
+        bias = self.bias_mlp(x)
+        
+        # The Formula: pos_embs = enc_mlp( x * multiplier + bias )
+        # This allows the model to suppress noise (multiplier~0) or highlight features
+        gated_geometry = (x * multiplier) + bias
+        
+        return self.enc_mlp(gated_geometry)
+
 class OPTBlock(nn.Module):
     def __init__(self, channels, win_size, stride=None, num_heads=4, dropout=0.0, win_chunk=256, ffn_ratio=2.0, indice_key=None, norm_layer=nn.BatchNorm1d):
         super().__init__()
@@ -241,24 +319,39 @@ class PatchEmbedding(nn.Module):
 
 @MODELS.register_module("OPTNet")
 class OPTNet(PointModule):
-    def __init__(self, in_channels=6, embed_dim=128, enc_depths=(2, 2, 6, 2), dec_depths=(1, 1, 1, 1), 
+    def __init__(self, in_channels=7, embed_dim=128, enc_depths=(2, 2, 6, 2), dec_depths=(1, 1, 1, 1), 
                  num_heads=4, win_sizes=(64, 64, 64, 64), base_grid_size=0.02, pool_factors=(2, 2, 2, 2), 
-                 dropout=0.0, ffn_ratio=3.0, win_chunk=256, ordering_loss_weight=0.1, warmup_epoch=0):
+                 dropout=0.0, ffn_ratio=3.0, win_chunk=256, ordering_loss_weight=0.1, warmup_epoch=0,
+                 scorer_type="point"):
         super().__init__()
         self.num_stages = len(enc_depths); self.ordering_loss_weight = ordering_loss_weight
         self.warmup_epoch = warmup_epoch; self.base_grid_size = base_grid_size; self.pool_factors = pool_factors
         self.all_strategies = ["z", "z-trans", "hilbert", "hilbert-trans"]
         norm_layer = partial(nn.BatchNorm1d, eps=1e-3, momentum=0.01)
 
-        self.init_scorer = PointScorer(embed_dim, hidden_dim=64)
-        self.patch_embed = PatchEmbedding(in_channels, embed_dim, base_grid_size, norm_layer=norm_layer)
-        self.feat_mlp = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.LayerNorm(embed_dim), nn.ReLU())
-        self.geom_mlp = nn.Sequential(nn.Linear(3, embed_dim), nn.LayerNorm(embed_dim), nn.ReLU())
+        def build_scorer(dim, h_dim=64):
+            if scorer_type == "context": return ContextGuidedScorer(dim, hidden_dim=h_dim)
+            else: return PointScorer(dim, hidden_dim=h_dim)
+
+        self.init_scorer = build_scorer(embed_dim, h_dim=64)
+        
+        # --- 1. Main Feature MLP (Restores PatchEmbedding capability) ---
+        # Takes ALL inputs (Color, Height, Displacement) -> (N, 128)
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(in_channels, embed_dim, bias=False),
+            norm_layer(embed_dim),
+            nn.ReLU()
+        )
+        
+        # --- 2. Gated Geometry MLP (eFPT Enhancement) ---
+        # Takes only Displacement -> (N, 128)
+        # Adds "smart" geometric context to the features
+        self.geom_mlp = GatedGeometryEmbedding(in_channels=3, embed_dim=embed_dim)
         
         self.enc_blocks = nn.ModuleList(); self.enc_scorers = nn.ModuleList(); self.enc_trans = nn.ModuleList()
         curr_dim = embed_dim
         for si in range(self.num_stages):
-            self.enc_scorers.append(PointScorer(curr_dim, hidden_dim=64))
+            self.enc_scorers.append(build_scorer(curr_dim, h_dim=64))
             self.enc_blocks.append(nn.ModuleList([
                 OPTBlock(curr_dim, win_sizes[si], indice_key=f"enc_s{si}", num_heads=num_heads, 
                          dropout=dropout, win_chunk=win_chunk, ffn_ratio=ffn_ratio, norm_layer=norm_layer) 
@@ -268,7 +361,7 @@ class OPTNet(PointModule):
 
         self.dec_blocks = nn.ModuleList(); self.dec_scorers = nn.ModuleList(); self.dec_trans = nn.ModuleList()
         for si in range(self.num_stages):
-            self.dec_scorers.append(PointScorer(curr_dim, hidden_dim=64))
+            self.dec_scorers.append(build_scorer(curr_dim, h_dim=64))
             if si < self.num_stages - 1: self.dec_trans.append(nn.Linear(curr_dim, curr_dim))
             self.dec_blocks.append(nn.ModuleList([
                 OPTBlock(curr_dim, win_sizes[si], indice_key=f"dec_s{si}", num_heads=num_heads, 
@@ -279,18 +372,46 @@ class OPTNet(PointModule):
 
     def forward(self, data_dict):
         point = Point(data_dict)
-        device = point.feat.device
-        point = self.patch_embed(point)
-        point.feat = self.feat_mlp(point.feat) + self.geom_mlp(point.coord)
-        offset = point.offset
         
+        # Manual Grid Coord Calculation (replaces PatchEmbedding logic)
+        if point.coord.shape[0] > 0:
+            point.grid_coord = torch.div(
+                point.coord - point.coord.min(0)[0], 
+                self.base_grid_size, 
+                rounding_mode='trunc'
+            ).int()
+
+        # --- Embedding Logic ---
+        
+        # 1. Feature Embedding: Process everything (Color + Height + Disp)
+        # This ensures we don't lose the raw features that worked before
+        f_feat = self.feature_mlp(point.feat)
+        
+        # 2. Geometry Embedding: Process only Displacement
+        # Extract displacement (last 3 channels)
+        if point.feat.shape[1] >= 3:
+            disp = point.feat[:, -3:]
+        else:
+            disp = torch.zeros((point.feat.shape[0], 3), device=point.feat.device)
+            
+        f_geom = self.geom_mlp(disp)
+        
+        # 3. Combine: Features + Gated Geometry
+        point.feat = f_feat + f_geom
+        # -----------------------
+
+        offset = point.offset
         if offset.numel() > 0:
             lengths = torch.cat([offset[0].unsqueeze(0), offset[1:] - offset[:-1]]).long()
         else:
-            lengths = torch.tensor([point.feat.shape[0]], device=device).long()
+            lengths = torch.tensor([point.feat.shape[0]], device=point.feat.device).long()
 
         current_epoch = data_dict.get("epoch", 0)
         total_aux_loss = 0.0
+        
+        # ... (Rest of the forward pass remains unchanged) ...
+        # Ensure you copy the remaining logic (Initial Sorting, Encoder, Decoder) 
+        # from the previous turn's code here.
         
         # --- 1. Initial Sorting ---
         learner_scores = self.init_scorer(point.feat, point.coord)
@@ -350,14 +471,14 @@ class OPTNet(PointModule):
                 point.apply_permutation(perm) 
                 
                 if lengths.sum() > 0:
-                    curr_offset = torch.cat([torch.tensor([0], device=device), torch.cumsum(lengths, dim=0)])
+                    curr_offset = torch.cat([torch.tensor([0], device=point.feat.device), torch.cumsum(lengths, dim=0)])
                     batch_indices = []
                     for b in range(len(lengths)):
-                        idx = torch.arange(curr_offset[b], curr_offset[b+1], stride, device=device)
+                        idx = torch.arange(curr_offset[b], curr_offset[b+1], stride, device=point.feat.device)
                         batch_indices.append(idx)
                     indices = torch.cat(batch_indices)
                 else:
-                    indices = torch.empty(0, device=device, dtype=torch.long)
+                    indices = torch.empty(0, device=point.feat.device, dtype=torch.long)
 
                 point.apply_permutation(indices)
                 point.feat = self.enc_trans[si](point.feat)
@@ -367,10 +488,10 @@ class OPTNet(PointModule):
                 point.offset = torch.cumsum(lengths, dim=0)
                 
                 if lengths.sum() > 0:
-                    batch_list = [torch.full((l,), i, device=device, dtype=torch.long) for i, l in enumerate(lengths)]
+                    batch_list = [torch.full((l,), i, device=point.feat.device, dtype=torch.long) for i, l in enumerate(lengths)]
                     point.batch = torch.cat(batch_list)
                 else:
-                    point.batch = torch.empty(0, device=device, dtype=torch.long)
+                    point.batch = torch.empty(0, device=point.feat.device, dtype=torch.long)
 
         # --- Decoder ---
         curr_lengths = lengths 
@@ -379,41 +500,37 @@ class OPTNet(PointModule):
                 if si < len(self.dec_trans): point.feat = self.dec_trans[si](point.feat)
                 
                 lengths_high, stride, enc_perm = up_metadata[si]
-                offset_low = torch.cat([torch.tensor([0], device=device), torch.cumsum(curr_lengths, dim=0)])
+                offset_low = torch.cat([torch.tensor([0], device=point.feat.device), torch.cumsum(curr_lengths, dim=0)])
                 ids_low_list = []
-                valid_mask_list = [] # Mask to zero out features gathered from dummy indices
+                valid_mask_list = [] 
                 
                 for b in range(len(curr_lengths)):
                     n_high = lengths_high[b].item()
                     n_low = curr_lengths[b].item()
                     
                     if n_high > 0:
-                        local_low_idx = torch.arange(n_high, device=device) // stride
+                        local_low_idx = torch.arange(n_high, device=point.feat.device) // stride
                         if n_low > 0:
                             local_low_idx = local_low_idx.clamp(max=n_low - 1)
                             global_low_idx = local_low_idx + offset_low[b]
                             ids_low_list.append(global_low_idx)
-                            valid_mask_list.append(torch.ones(n_high, device=device, dtype=torch.bool))
+                            valid_mask_list.append(torch.ones(n_high, device=point.feat.device, dtype=torch.bool))
                         else:
-                            # Gradient Safety Fix:
-                            # Map to 0, but mark as invalid so we zero out the result.
-                            # This prevents index 0 from accumulating gradients from all empty batches.
-                            ids_low_list.append(torch.zeros(n_high, device=device, dtype=torch.long)) 
-                            valid_mask_list.append(torch.zeros(n_high, device=device, dtype=torch.bool))
+                            ids_low_list.append(torch.zeros(n_high, device=point.feat.device, dtype=torch.long)) 
+                            valid_mask_list.append(torch.zeros(n_high, device=point.feat.device, dtype=torch.bool))
                     else:
-                        ids_low_list.append(torch.empty(0, device=device, dtype=torch.long))
-                        valid_mask_list.append(torch.empty(0, device=device, dtype=torch.bool))
+                        ids_low_list.append(torch.empty(0, device=point.feat.device, dtype=torch.long))
+                        valid_mask_list.append(torch.empty(0, device=point.feat.device, dtype=torch.bool))
                 
-                ids_low = torch.cat(ids_low_list) if len(ids_low_list) > 0 else torch.empty(0, device=device, dtype=torch.long)
-                valid_mask = torch.cat(valid_mask_list) if len(valid_mask_list) > 0 else torch.empty(0, device=device, dtype=torch.bool)
+                ids_low = torch.cat(ids_low_list) if len(ids_low_list) > 0 else torch.empty(0, device=point.feat.device, dtype=torch.long)
+                valid_mask = torch.cat(valid_mask_list) if len(valid_mask_list) > 0 else torch.empty(0, device=point.feat.device, dtype=torch.bool)
                 
                 if ids_low.numel() > 0 and point.feat.shape[0] > 0:
                     ids_low = ids_low.clamp(max=point.feat.shape[0] - 1)
                     x_up = point.feat[ids_low]
-                    # Apply mask to kill gradients from invalid fetches
                     x_up = x_up * valid_mask.unsqueeze(-1)
                 else:
-                    x_up = torch.zeros((ids_low.shape[0], point.feat.shape[1]), device=device)
+                    x_up = torch.zeros((ids_low.shape[0], point.feat.shape[1]), device=point.feat.device)
 
                 x_up = x_up[torch.argsort(enc_perm)] + skips[si]
                 
@@ -424,10 +541,10 @@ class OPTNet(PointModule):
                 curr_lengths = lengths_high
                 point.offset = torch.cumsum(curr_lengths, dim=0)
                 if curr_lengths.sum() > 0:
-                    batch_list = [torch.full((l,), i, device=device, dtype=torch.long) for i, l in enumerate(curr_lengths)]
+                    batch_list = [torch.full((l,), i, device=point.feat.device, dtype=torch.long) for i, l in enumerate(curr_lengths)]
                     point.batch = torch.cat(batch_list)
                 else:
-                    point.batch = torch.empty(0, device=device, dtype=torch.long)
+                    point.batch = torch.empty(0, device=point.feat.device, dtype=torch.long)
 
                 if "sparse_shape" in point: del point["sparse_shape"]
                 if "sparse_conv_feat" in point: del point["sparse_conv_feat"]
