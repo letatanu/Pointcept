@@ -12,7 +12,16 @@ from pointcept.engines.defaults import (
 )
 from pointcept.engines.train import TRAINERS
 from pointcept.engines.launch import launch
+import torch
+import torch.multiprocessing
 
+# ----------------------------------------------------------------------------
+# FIX: Change sharing strategy to avoid "Too many open files" / Shared Memory errors
+# ----------------------------------------------------------------------------
+try:
+    torch.multiprocessing.set_sharing_strategy('file_system')
+except RuntimeError:
+    pass
 
 def main_worker(cfg):
     cfg = default_setup(cfg)
