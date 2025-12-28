@@ -153,7 +153,9 @@ model = dict(
         ffn_ratio=3.0,
         ordering_loss_weight=0.1,
         warmup_epoch=20,        # Epochs of Teacher Forcing
-        scorer_type="point"
+        # scorer_type="point", 
+        # enable_spcpe = True, 
+        # enable_gated_cpe = True
         ),
     criteria=[
         dict(type="CrossEntropyLoss", 
