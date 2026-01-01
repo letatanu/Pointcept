@@ -182,6 +182,7 @@ class Trainer(TrainerBase):
             self.after_train()
 
     def run_step(self):
+        
         if version.parse(torch.__version__) >= version.parse("2.4"):
             auto_cast = partial(torch.amp.autocast, device_type="cuda")
         else:
@@ -189,6 +190,7 @@ class Trainer(TrainerBase):
             auto_cast = torch.cuda.amp.autocast
 
         input_dict = self.comm_info["input_dict"]
+        input_dict["epoch"] = self.epoch
         for key in input_dict.keys():
             if isinstance(input_dict[key], torch.Tensor):
                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
