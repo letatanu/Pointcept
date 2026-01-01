@@ -1,23 +1,85 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-# Data Configuration
-# ----------------------------------------------------------------------------
-data_root = "data/AeroRelief3D/pcd_1"
-grid_size = 0.22
-ignore_index= -1
-data = dict(
-    num_classes=5,
-    ignore_index=ignore_index,
-    names=[
-        "Background",
-        "Building-Damage",
-        "Building-No-Damage",
-        "Road",
-        "Tree"
+# misc custom setting
+batch_size = 16  # bs: total bs in all gpus
+mix_prob = 0.8
+empty_cache = False
+enable_amp = False
+ignore_index = -1
+enable_wandb = False
+names = ["Building-Damage", "Building-No-Damage",  "Road", "Tree", "Background"]
+grid_size = 0.2
+
+# model settings
+model = dict(
+    type="OPTNetSegmentor",
+    num_classes=len(names),
+    backbone_out_channels=64,
+    backbone=dict(
+        type="OPTNet",
+        in_channels=6,
+        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+        stride=(2, 2, 2, 2),
+        enc_depths=(2, 2, 2, 6, 2),
+        enc_channels=(32, 64, 128, 256, 512),
+        enc_num_head=(2, 4, 8, 16, 32),
+        enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        dec_depths=(2, 2, 2, 2),
+        dec_channels=(64, 64, 128, 256),
+        dec_num_head=(4, 4, 8, 16),
+        dec_patch_size=(1024, 1024, 1024, 1024),
+        mlp_ratio=4,
+        qkv_bias=True,
+        qk_scale=None,
+        attn_drop=0.0,
+        proj_drop=0.0,
+        drop_path=0.3,
+        shuffle_orders=True,
+        pre_norm=True,
+        enable_rpe=False,
+        enable_flash=True,
+        upcast_attention=False,
+        upcast_softmax=False,
+        enc_mode=False,
+        pdnorm_bn=False,
+        pdnorm_ln=False,
+        pdnorm_decouple=True,
+        pdnorm_adaptive=False,
+        pdnorm_affine=True,
+        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        warmup_epoch = 5,
+        ordering_loss_weight = 1.0
+    ),
+    criteria=[
+        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
+        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
+)
+
+# scheduler settings
+epoch = 3000
+optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
+scheduler = dict(
+    type="OneCycleLR",
+    max_lr=[0.006, 0.0006],
+    pct_start=0.05,
+    anneal_strategy="cos",
+    div_factor=10.0,
+    final_div_factor=1000.0,
+)
+param_dicts = [dict(keyword="block", lr=0.0006)]
+
+# dataset settings
+dataset_type = "AeroRelief3DDataset"
+data_root = "data/AeroRelief3D/pcd_1"
+
+data = dict(
+    num_classes=len(names),
+    ignore_index=ignore_index,
+    names=names,
     train=dict(
-        type="AeroRelief3DDataset",
-        split=["Area_1", "Area_3", "Area_4", "Area_5", "Area_6", "Area_7", "Area_8"],
+        type=dataset_type,
+        split=("Area_1", "Area_3", "Area_4", "Area_5", "Area_6", "Area_7", "Area_8"),
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
@@ -44,144 +106,77 @@ data = dict(
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
-                return_displacement=True
             ),
             dict(type="SphereCrop", sample_rate=0.6, mode="random"),
             dict(type="SphereCrop", point_max=204800, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
-            dict(type="ConcatHeightToColor"),
             # dict(type="ShufflePoint"),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment"),
-                feat_keys=("color", "displacement"),
+                feat_keys=("coord", "color"),
             ),
         ],
         test_mode=False,
     ),
     val=dict(
-        type="AeroRelief3DDataset",
-        split=["Area_2"],
+        type=dataset_type,
+        split="Area_2",
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
-            dict(type="GridSample", 
-                 grid_size=grid_size, 
-                 hash_type="fnv", mode="train", 
-                 return_grid_coord=True,
-                return_displacement=True
-                ),
+            dict(type="Copy", keys_dict={"segment": "origin_segment"}),
+            dict(
+                type="GridSample",
+                grid_size=grid_size,
+                hash_type="fnv",
+                mode="train",
+                return_grid_coord=True,
+                return_inverse=True,
+            ),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
-            dict(type="ConcatHeightToColor"),
             dict(type="ToTensor"),
-            dict(type="Collect", 
-                 keys=("coord", "grid_coord", "segment"), 
-                 feat_keys=("color", "displacement"))
+            dict(
+                type="Collect",
+                keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
+                feat_keys=("coord", "color"),
+            ),
         ],
         test_mode=False,
     ),
     test=dict(
-        type="AeroRelief3DDataset",
-        split=["Area_2"], # or 'test' if labels hidden
+        type=dataset_type,
+        split="Area_2",
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="NormalizeColor"),
-            dict(type="ConcatHeightToColor"),
         ],
         test_mode=True,
         test_cfg=dict(
-            voxelize=dict(type="GridSample", 
-                          grid_size=grid_size, 
-                          hash_type="fnv", 
-                          mode="test", 
-                          return_grid_coord=True,
-                          return_displacement=True
-                          ),
+            voxelize=dict(
+                type="GridSample",
+                grid_size=grid_size,
+                hash_type="fnv",
+                mode="test",
+                return_grid_coord=True,
+            ),
             crop=None,
             post_transform=[
                 dict(type="CenterShift", apply_z=False),
                 dict(type="ToTensor"),
-                dict(type="Collect", 
-                     keys=("coord", "grid_coord", "index"), 
-                     feat_keys=("color", "displacement"))
+                dict(
+                    type="Collect",
+                    keys=("coord", "grid_coord", "index"),
+                    feat_keys=("coord", "color"),
+                ),
             ],
-            aug_transform=[
-                [dict(type="RandomScale", scale=[0.9, 1.1])],
-                # [
-                #     dict(type="RandomScale", scale=[0.95, 0.95]),
-                #     dict(type="RandomFlip", p=1),
-                # ],
-                # [
-                #     dict(type="RandomScale", scale=[1, 1]),
-                #     dict(type="RandomFlip", p=1),
-                # ],
-                # [
-                #     dict(type="RandomScale", scale=[1.05, 1.05]),
-                #     dict(type="RandomFlip", p=1),
-                # ],
-                # [
-                #     dict(type="RandomScale", scale=[1.1, 1.1]),
-                #     dict(type="RandomFlip", p=1),
-                # ],
+            aug_transform = [
+                [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1)]
             ]
-        )
+        ),
     ),
 )
-
-# Model Configuration
-# ----------------------------------------------------------------------------
-model = dict(
-    type="OPTNetSegmentor", # Uses the custom segmentor to handle aux_loss
-    num_classes=5,
-    backbone_out_channels=256,
-    backbone=dict(
-        type="OPTNet",
-        in_channels=7,          # 3 (Color) + height + 3 (Displacement)
-        embed_dim=256,
-        enc_depths=(2,2),
-        dec_depths=(1,1),
-        num_heads=8,
-        win_sizes=(256,256),
-        win_chunk=1024,
-        base_grid_size=grid_size,    # Matches GridSample grid_size
-        pool_factors=(2, 2),
-        dropout=0.0,
-        ffn_ratio=3.0,
-        ordering_loss_weight=0.1,
-        warmup_epoch=20,        # Epochs of Teacher Forcing
-        # scorer_type="point", 
-        # enable_spcpe = True, 
-        # enable_gated_cpe = True
-        ),
-    criteria=[
-        dict(type="CrossEntropyLoss", 
-             loss_weight=1.0, 
-             ignore_index=ignore_index,
-            #  weight=[0.0, 1.0, 2.0, 5.0, 5.0]
-             ),
-        dict(type="LovaszLoss", mode="multiclass", 
-             loss_weight=1.0, 
-             ignore_index=ignore_index)
-             ],
-)
-
-# Scheduler & Optimizer
-# ----------------------------------------------------------------------------
-optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.05)
-scheduler = dict(type="OneCycleLR", max_lr=0.002, 
-                 pct_start=0.04, anneal_strategy="cos", 
-                 div_factor=10.0, final_div_factor=1000.0)
-
-# Training Settings
-# ----------------------------------------------------------------------------
-batch_size = 4  # Adjust based on GPU memory
-epoch = 600
-enable_amp = False
-empty_cache = False
-num_worker = 4
-resume = False
-clip_grad = 10.0 
