@@ -7,7 +7,7 @@ empty_cache = False
 enable_amp = False
 ignore_index = -1
 enable_wandb = False
-names = ["Building-Damage", "Building-No-Damage",  "Road", "Tree", "Background"]
+names = ["Background", "Building-Damage", "Building-No-Damage",  "Road", "Tree"]
 grid_size = 0.2
 
 # model settings
