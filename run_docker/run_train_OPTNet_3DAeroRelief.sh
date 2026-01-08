@@ -23,7 +23,8 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
   --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
-  -v /media/volume/data_cvpr/project/semantic_3d/Pointcept/:/working \
+  -v /media/volume/data/project/semantic_3d/Pointcept/:/working \
+  -v /media/volume/data/project/semantic_3d/data/:/working/data \
   -e OMP_NUM_THREADS=${OMP_NUM_THREADS} \
   "${DOCKER_IMAGE}"  bash -lc "
   sh scripts/train.sh \
