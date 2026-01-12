@@ -13,7 +13,7 @@ DOCKER_IMAGE="letatanu/poincept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="optnet"
-EXP_NAME="optnet_s3dis_2"
+EXP_NAME="optnet_s3dis_4"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
 echo "Model Name: $MODEL_NAME"
