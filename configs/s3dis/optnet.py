@@ -1,7 +1,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 16  # bs: total bs in all gpus
+batch_size = 8  # bs: total bs in all gpus
 mix_prob = 0.8
 empty_cache = False
 enable_amp = False
@@ -61,9 +61,9 @@ model = dict(
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
-        warmup_epoch = 15,
+        warmup_epoch = 5,
         ordering_loss_weight = 0.5, 
-        ordering_k = 48
+        ordering_k = 32
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
