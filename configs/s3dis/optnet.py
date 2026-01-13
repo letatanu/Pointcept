@@ -1,7 +1,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 8  # bs: total bs in all gpus
+batch_size = 4  # bs: total bs in all gpus
 mix_prob = 0.8
 empty_cache = False
 enable_amp = False
@@ -22,7 +22,7 @@ names=[
         "board",
         "clutter",
     ]
-grid_size = 0.02
+grid_size = 0.01
 
 # model settings
 model = dict(
@@ -131,7 +131,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment"),
-                feat_keys=("coord", "color"),
+                feat_keys=("coord", "normal"),
             ),
         ],
         test_mode=False,
@@ -157,7 +157,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
-                feat_keys=("coord", "color"),
+                feat_keys=("coord", "normal"),
             ),
         ],
         test_mode=False,
@@ -186,7 +186,7 @@ data = dict(
                 dict(
                     type="Collect",
                     keys=("coord", "grid_coord", "index"),
-                    feat_keys=("coord", "color"),
+                    feat_keys=("coord", "normal"),
                 ),
             ],
             aug_transform = [
