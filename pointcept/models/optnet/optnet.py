@@ -173,22 +173,20 @@ class OPTNet(PointTransformerV3):
         loss_dist = ((sorted_scores - target) ** 2).mean()
         
         # 2. Hilbert/Z-order Teacher Regularization
-        loss_teacher = 0.0
-        if "serialized_code" in point.keys():
-             # point.serialized_code is (4, N) (e.g., Z, Z-trans, Hilbert, Hilbert-trans)
-             # We transpose it to (N, 4) to match 'scores'
-             t_codes = point.serialized_code.float().transpose(0, 1).to(scores.device)
-             
-             # Normalize each column independently to [0, 1] range
-             # This handles the different coordinate ranges of Z vs Hilbert
-             t_min = t_codes.min(dim=0, keepdim=True)[0]
-             t_max = t_codes.max(dim=0, keepdim=True)[0]
-             
-             # Safety: add epsilon to avoid div by zero
-             t_norm = (t_codes - t_min) / (t_max - t_min + 1e-6)
-             
-             # MSE: Force Head 0->Z, Head 1->Z-trans, etc.
-             loss_teacher = 0.1 * ((scores - t_norm) ** 2).mean()
+        # point.serialized_code is (4, N) (e.g., Z, Z-trans, Hilbert, Hilbert-trans)
+        # We transpose it to (N, 4) to match 'scores'
+        t_codes = point.serialized_code.float().transpose(0, 1).to(scores.device)
+        
+        # Normalize each column independently to [0, 1] range
+        # This handles the different coordinate ranges of Z vs Hilbert
+        t_min = t_codes.min(dim=0, keepdim=True)[0]
+        t_max = t_codes.max(dim=0, keepdim=True)[0]
+        
+        # Safety: add epsilon to avoid div by zero
+        t_norm = (t_codes - t_min) / (t_max - t_min + 1e-6)
+        
+        # MSE: Force Head 0->Z, Head 1->Z-trans, etc.
+        loss_teacher = 0.1 * ((scores - t_norm) ** 2).mean()
 
         return loss_local + loss_dist + loss_teacher
 
@@ -202,7 +200,7 @@ class OPTNet(PointTransformerV3):
 
         # 2. Run OPTNet Sorter
         scores, learned_order, learned_inverse = self.sorter(point)
-
+        ordering_loss_weight = self.ordering_loss_weight if self.training else 0.0
         # 3. Apply Order Strategy
         if current_epoch >= self.warmup_epoch:
             # We update the serialized_order. The Window Attention in PTv3 
@@ -211,11 +209,12 @@ class OPTNet(PointTransformerV3):
             point.serialized_inverse = learned_inverse
             # Note: We do NOT update point.serialized_code. 
             # Pooling layers must rely on geometric Morton codes to merge neighbors correctly.
+            ordering_loss_weight = self.ordering_loss_weight*2.0 if self.training else 0.0
 
         # 4. Calculate Loss
-        if self.training and self.ordering_loss_weight > 0:
+        if self.training and ordering_loss_weight > 0.0:
             loss_ord = self.compute_ordering_loss(point, scores)
-            point["ordering_loss"] = loss_ord * self.ordering_loss_weight
+            point["ordering_loss"] = loss_ord * ordering_loss_weight
 
         # 5. Backbone Forward
         point = self.embedding(point)
