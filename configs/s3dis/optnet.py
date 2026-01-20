@@ -1,7 +1,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 4  # bs: total bs in all gpus
+batch_size = 14  # bs: total bs in all gpus
 mix_prob = 0.8
 empty_cache = False
 enable_amp = False
@@ -61,9 +61,9 @@ model = dict(
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
-        warmup_epoch = 5,
-        ordering_loss_weight = 0.5, 
-        ordering_k = 32
+        warmup_epoch = 0,
+        ordering_loss_weight = 1.0, 
+        ordering_k = 16
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
@@ -131,7 +131,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment"),
-                feat_keys=("coord", "normal"),
+                feat_keys=("coord", "color"),
             ),
         ],
         test_mode=False,
@@ -157,7 +157,7 @@ data = dict(
             dict(
                 type="Collect",
                 keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
-                feat_keys=("coord", "normal"),
+                feat_keys=("coord", "color"),
             ),
         ],
         test_mode=False,
@@ -186,7 +186,7 @@ data = dict(
                 dict(
                     type="Collect",
                     keys=("coord", "grid_coord", "index"),
-                    feat_keys=("coord", "normal"),
+                    feat_keys=("coord", "color"),
                 ),
             ],
             aug_transform = [
