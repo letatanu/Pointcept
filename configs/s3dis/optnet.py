@@ -1,37 +1,37 @@
+# config_optnet_contrastive.py
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 14  # bs: total bs in all gpus
+batch_size = 16
 mix_prob = 0.8
-empty_cache = False
-enable_amp = False
-ignore_index = -1
-enable_wandb = False
-names=[
-        "ceiling",
-        "floor",
-        "wall",
-        "beam",
-        "column",
-        "window",
-        "door",
-        "table",
-        "chair",
-        "sofa",
-        "bookcase",
-        "board",
-        "clutter",
-    ]
-grid_size = 0.01
+empty_cache = True
+enable_amp = True
+find_unused_parameters = False
 
 # model settings
 model = dict(
     type="OPTNetSegmentor",
-    num_classes=len(names),
-    backbone_out_channels=64,
     backbone=dict(
         type="OPTNet",
         in_channels=6,
+        
+        # ============================================
+        # Ordering Loss Parameters
+        # ============================================
+        ordering_loss_weight=1.0,      # Overall weight for ordering loss
+        ordering_k=16,                 # k-NN for locality loss
+        warmup_epoch=0,                # Start using learned order from epoch 0
+        
+        # ============================================
+        # NEW: Contrastive Loss Parameters
+        # ============================================
+        contrastive_k_far=32,          # k for far neighbors (recommend 32-48)
+        contrastive_temp=0.5,          # Temperature for contrastive loss (0.3-0.7)
+        contrastive_weight=0.5,        # Weight for contrastive component (0.3-0.8)
+        
+        # ============================================
+        # PTv3 Backbone Parameters
+        # ============================================
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
@@ -61,63 +61,72 @@ model = dict(
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
-        warmup_epoch = 0,
-        ordering_loss_weight = 1.0, 
-        ordering_k = 16
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
+    num_classes=13,
+    backbone_out_channels=64,
 )
 
 # scheduler settings
-epoch = 3000
-optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
+epoch = 800
+eval_epoch = 100
+optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
+    max_lr=optimizer["lr"],
     pct_start=0.05,
     anneal_strategy="cos",
     div_factor=10.0,
     final_div_factor=1000.0,
 )
-param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
 dataset_type = "S3DISDataset"
 data_root = "data/S3DIS/pointcept"
 
 data = dict(
-    num_classes=len(names),
-    ignore_index=ignore_index,
-    names=names,
+    num_classes=13,
+    ignore_index=-1,
+    names=[
+        "ceiling",
+        "floor",
+        "wall",
+        "beam",
+        "column",
+        "window",
+        "door",
+        "table",
+        "chair",
+        "sofa",
+        "bookcase",
+        "board",
+        "clutter",
+    ],
     train=dict(
         type=dataset_type,
-        split=("Area_1", "Area_2", "Area_3", "Area_4", "Area_6"),
+        split=["Area_1", "Area_2", "Area_3", "Area_4", "Area_6"],
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
-            dict(
-                type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2
-            ),
-            # dict(type="RandomRotateTargetAngle", angle=(1/2, 1, 3/2), center=[0, 0, 0], axis="z", p=0.75),
+            dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
+            # Rotation
             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
-            dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="x", p=0.5),
-            dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="y", p=0.5),
+            dict(type="RandomRotate", angle=[-1/64, 1/64], axis="x", p=0.5),
+            dict(type="RandomRotate", angle=[-1/64, 1/64], axis="y", p=0.5),
             dict(type="RandomScale", scale=[0.9, 1.1]),
-            # dict(type="RandomShift", shift=[0.2, 0.2, 0.2]),
             dict(type="RandomFlip", p=0.5),
             dict(type="RandomJitter", sigma=0.005, clip=0.02),
-            # dict(type="ElasticDistortion", distortion_params=[[0.2, 0.4], [0.8, 1.6]]),
+            # Color augmentation
             dict(type="ChromaticAutoContrast", p=0.2, blend_factor=None),
             dict(type="ChromaticTranslation", p=0.95, ratio=0.05),
             dict(type="ChromaticJitter", p=0.95, std=0.05),
-            # dict(type="HueSaturationTranslation", hue_max=0.2, saturation_max=0.2),
-            # dict(type="RandomColorDrop", p=0.2, color_augment=0.0),
+            # Voxelization
             dict(
                 type="GridSample",
-                grid_size=grid_size,
+                grid_size=0.02,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
@@ -126,7 +135,6 @@ data = dict(
             dict(type="SphereCrop", point_max=204800, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
-            # dict(type="ShufflePoint"),
             dict(type="ToTensor"),
             dict(
                 type="Collect",
@@ -135,6 +143,7 @@ data = dict(
             ),
         ],
         test_mode=False,
+        loop=8,  # 8 loops for 204 * 8 = 1632 samples per epoch
     ),
     val=dict(
         type=dataset_type,
@@ -145,7 +154,7 @@ data = dict(
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),
             dict(
                 type="GridSample",
-                grid_size=grid_size,
+                grid_size=0.02,
                 hash_type="fnv",
                 mode="train",
                 return_grid_coord=True,
@@ -174,7 +183,7 @@ data = dict(
         test_cfg=dict(
             voxelize=dict(
                 type="GridSample",
-                grid_size=grid_size,
+                grid_size=0.02,
                 hash_type="fnv",
                 mode="test",
                 return_grid_coord=True,
@@ -189,9 +198,23 @@ data = dict(
                     feat_keys=("coord", "color"),
                 ),
             ],
-            aug_transform = [
-                [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1)]
-            ]
+            aug_transform=[
+                [dict(type="RandomRotateTargetAngle", angle=[0], axis="z", center=[0, 0, 0], p=1)],
+            ],
         ),
     ),
 )
+
+# hook
+hooks = [
+    dict(type="CheckpointLoader"),
+    dict(type="IterationTimer", warmup_iter=2),
+    dict(type="InformationWriter"),
+    dict(type="SemSegEvaluator"),
+    dict(type="CheckpointSaver", save_freq=None),
+    dict(type="PreciseEvaluator", test_last=False),
+]
+
+# runtime
+train = dict(type="DefaultTrainer")
+test = dict(type="SemSegTester", verbose=True)
