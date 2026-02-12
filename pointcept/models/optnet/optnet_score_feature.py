@@ -38,6 +38,7 @@ class PointSorter(nn.Module):
         )
 
     def _zorder_init(self, in_channels):
+        """Initializes MLP to approximate Z-order curve using standard encode."""
         device = next(self.parameters()).device if list(self.parameters()) else 'cpu'
         
         for layer in self.mlp[:-1]:
@@ -83,22 +84,19 @@ class PointSorter(nn.Module):
             last_layer.bias.copy_(bias.repeat(out_dim))
 
     def forward(self, point):
-        # 1. Prepare Input (Handle NaNs early)
         if point.feat is not None:
             inp = torch.cat([point.coord, point.feat], dim=1)
         else:
             inp = point.coord
 
         inp = torch.nan_to_num(inp, nan=0.0)
-        inp = torch.clamp(inp, -10.0, 10.0) # Conservative clamp
+        inp = torch.clamp(inp, -10.0, 10.0)
 
-        # 2. Predict Scores
         logits = self.mlp(inp)
         scores = torch.sigmoid(logits)
-        scores = torch.clamp(scores, min=1e-5, max=1-1e-5)
+        scores = torch.clamp(scores, min=1e-6, max=1-1e-6)
 
-        # 3. Generate Orders
-        # Add batch offset to sort within batches
+        # Add offset to separate batches for sorting
         batch_offset = point.batch.unsqueeze(1) * 100000.0
         scores_for_sort = scores + batch_offset 
 
@@ -108,11 +106,8 @@ class PointSorter(nn.Module):
         scores_t = scores_for_sort.transpose(0, 1)
 
         for i in range(scores_t.shape[0]):
-            # --- STABILITY FIX: Add Noise to break ties ---
-            # Tie-breaking is crucial for stable pooling and unique ranks
-            noise = torch.rand_like(scores_t[i]) * 1e-6
-            
-            order = torch.argsort((scores_t[i] + noise).detach(), stable=True)
+            # Detach for Hard Sort indices (non-differentiable)
+            order = torch.argsort(scores_t[i].detach())
             inverse = torch.zeros_like(order)
             inverse[order] = torch.arange(len(order), device=order.device)
             orders_list.append(order)
@@ -141,7 +136,6 @@ class SelfSupervisedOrderingLoss(nn.Module):
         else:
             scores_mean = scores.view(-1, 1)
         
-        # Handle NaN/Inf in scores
         scores_mean = torch.nan_to_num(scores_mean, nan=0.5)
         
         if offset is None:
@@ -155,11 +149,6 @@ class SelfSupervisedOrderingLoss(nn.Module):
         loss_contrastive = self._compute_contrastive_loss(scores_mean, coords, offset)
         loss_distribution = self._compute_distribution_loss(scores_mean, batch_ids)
         
-        # Check for NaN in losses
-        if torch.isnan(loss_locality): loss_locality = torch.tensor(0.0, device=scores.device)
-        if torch.isnan(loss_contrastive): loss_contrastive = torch.tensor(0.0, device=scores.device)
-        if torch.isnan(loss_distribution): loss_distribution = torch.tensor(0.0, device=scores.device)
-
         total_loss = (1.0 * loss_locality + 
                       0.5 * loss_contrastive + 
                       1.0 * loss_distribution)
@@ -175,9 +164,6 @@ class SelfSupervisedOrderingLoss(nn.Module):
             k = min(self.ordering_k, scores.shape[0] - 1)
             idx = pointops.knn_query(k, coords.contiguous(), offset)[0].long()
             
-            # --- SAFETY CLAMP (CRITICAL) ---
-            idx = torch.clamp(idx, min=0, max=scores.shape[0] - 1)
-            
             neighbor_scores = scores[idx] 
             loss = F.mse_loss(scores.unsqueeze(1).expand_as(neighbor_scores), neighbor_scores)
             return loss
@@ -186,7 +172,7 @@ class SelfSupervisedOrderingLoss(nn.Module):
     def _compute_contrastive_loss(self, scores, coords, offset):
         try:
             var = torch.var(scores)
-            return torch.relu(0.08 - var + 1e-6) 
+            return torch.relu(0.08 - var) 
         except: return torch.tensor(0.0, device=scores.device)
 
     def _compute_distribution_loss(self, scores, batch_ids):
@@ -225,7 +211,7 @@ class OPTNet(PointTransformerV3):
                  contrastive_weight=0.5,
                  **kwargs):
         
-        # Force Single Order Mode
+        # --- Single Order Override (Fixes IndexError) ---
         if isinstance(order, (list, tuple)):
             single_order = [order[0]]
         else:
@@ -265,19 +251,29 @@ class OPTNet(PointTransformerV3):
         point.sparsify()
         
         # 2. Run OPTNet Sorter
+        # scores has shape [N, 1]
         scores, learned_order, learned_inverse = self.sorter(point)
         
-        # 3. Apply Order Strategy
+        # 3. Differentiable "Soft-Permutation" Proxy (Modulation)
+        # This allows gradients from the segmentation loss to flow back to the Sorter.
+        # If a point is important for the task, the gradient will adjust the score,
+        # which effectively adjusts its position in the sort.
+        if point.feat is not None:
+            # Residual modulation: feat * (1 + scores)
+            # scores are in [0, 1]. This boosts important features up to 2x.
+            point.feat = point.feat * (1.0 + scores)
+
+        # 4. Apply Order Strategy
         if not need_standard_z:
             point.serialized_order = learned_order
             point.serialized_inverse = learned_inverse
 
-            # --- POOLING COMPATIBILITY FIX ---
-            # Use Rank (inverse) with [1, N] shape.
+            # Use Rank for Pooling (Fixes Crash)
+            # Unsqueeze to [1, N] to match SerializedPooling requirements (Fixes IndexError)
             primary_inverse = learned_inverse[0] 
             point.serialized_code = primary_inverse.unsqueeze(0).long() 
             
-        # 4. Calculate Loss
+        # 5. Calculate Loss
         if self.training and self.ordering_loss_weight > 0:
             loss_ord, loss_dict = self.sorter.compute_loss(
                 scores, 
@@ -285,11 +281,9 @@ class OPTNet(PointTransformerV3):
                 point.batch, 
                 point.offset
             )
-            # Clip loss to prevent gradient explosion
-            loss_ord = torch.clamp(loss_ord, max=5.0) 
             point.ordering_loss = loss_ord * self.ordering_loss_weight
  
-        # 5. Backbone Forward
+        # 6. Backbone Forward
         point = self.embedding(point)
         point = self.enc(point)
         if not self.enc_mode:
@@ -312,11 +306,9 @@ class OPTNetSegmentor(nn.Module):
         if self.training:
             loss = self.criteria(seg_logits, data_dict["segment"])
             return_dict = dict(seg_loss=loss)
-            
             if "ordering_loss" in point:
                 loss = loss + point["ordering_loss"]
                 return_dict["ordering_loss"] = point["ordering_loss"]
-            
             return_dict["loss"] = loss
             return return_dict
         

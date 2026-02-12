@@ -50,64 +50,55 @@ class Point(Dict):
         elif "offset" not in self.keys() and "batch" in self.keys():
             self["offset"] = batch2offset(self.batch)
 
-    def serialization(self, order="z", depth=None, shuffle_orders=False):
+        # Update the signature to accept compute_codes=True
+    def serialization(self, order="z", depth=None, shuffle_orders=False, compute_codes=True):
         """
         Point Cloud Serialization
-
-        relay on ["grid_coord" or "coord" + "grid_size", "batch", "feat"]
+        
+        compute_codes (bool): If False, only computes grid_coord and depth, skipping 
+                              Z-order code generation and sorting.
         """
         self["order"] = order
         assert "batch" in self.keys()
+        
+        # --- PART 1: Grid Setup (Always run this) ---
         if "grid_coord" not in self.keys():
-            # if you don't want to operate GridSampling in data augmentation,
-            # please add the following augmentation into your pipline:
-            # dict(type="Copy", keys_dict={"grid_size": 0.01}),
-            # (adjust `grid_size` to what your want)
             assert {"grid_size", "coord"}.issubset(self.keys())
-
             self["grid_coord"] = torch.div(
                 self.coord - self.coord.min(0)[0], self.grid_size, rounding_mode="trunc"
             ).int()
 
         if depth is None:
-            # Adaptive measure the depth of serialization cube (length = 2 ^ depth)
             depth = int(self.grid_coord.max() + 1).bit_length()
         self["serialized_depth"] = depth
-        # Maximum bit length for serialization code is 63 (int64)
+        
         assert depth * 3 + len(self.offset).bit_length() <= 63
-        # Here we follow OCNN and set the depth limitation to 16 (48bit) for the point position.
-        # Although depth is limited to less than 16, we can encode a 655.36^3 (2^16 * 0.01) meter^3
-        # cube with a grid size of 0.01 meter. We consider it is enough for the current stage.
-        # We can unlock the limitation by optimizing the z-order encoding function if necessary.
         assert depth <= 16
 
-        # The serialization codes are arranged as following structures:
-        # [Order1 ([n]),
-        #  Order2 ([n]),
-        #   ...
-        #  OrderN ([n])] (k, n)
-        code = [
-            encode(self.grid_coord, self.batch, depth, order=order_) for order_ in order
-        ]
-        code = torch.stack(code)
-        order = torch.argsort(code)
-        inverse = torch.zeros_like(order).scatter_(
-            dim=1,
-            index=order,
-            src=torch.arange(0, code.shape[1], device=order.device).repeat(
-                code.shape[0], 1
-            ),
-        )
+        # --- PART 2: Code Generation (Skip if learned order will replace it) ---
+        if compute_codes:
+            code = [
+                encode(self.grid_coord, self.batch, depth, order=order_) for order_ in order
+            ]
+            code = torch.stack(code)
+            order = torch.argsort(code)
+            inverse = torch.zeros_like(order).scatter_(
+                dim=1,
+                index=order,
+                src=torch.arange(0, code.shape[1], device=order.device).repeat(
+                    code.shape[0], 1
+                ),
+            )
 
-        if shuffle_orders:
-            perm = torch.randperm(code.shape[0])
-            code = code[perm]
-            order = order[perm]
-            inverse = inverse[perm]
+            if shuffle_orders:
+                perm = torch.randperm(code.shape[0])
+                code = code[perm]
+                order = order[perm]
+                inverse = inverse[perm]
 
-        self["serialized_code"] = code
-        self["serialized_order"] = order
-        self["serialized_inverse"] = inverse
+            self["serialized_code"] = code
+            self["serialized_order"] = order
+            self["serialized_inverse"] = inverse
 
     def sparsify(self, pad=96):
         """
