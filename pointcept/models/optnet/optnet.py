@@ -99,7 +99,7 @@ class PointSorter(nn.Module):
 
         # 3. Generate Orders
         # Add batch offset to sort within batches
-        batch_offset = point.batch.unsqueeze(1) * 100000.0
+        batch_offset = point.batch.unsqueeze(1) * 2.0
         scores_for_sort = scores + batch_offset 
 
         orders_list = []
@@ -171,23 +171,28 @@ class SelfSupervisedOrderingLoss(nn.Module):
         }
     
     def _compute_locality_loss(self, scores, coords, offset):
-        try:
-            k = min(self.ordering_k, scores.shape[0] - 1)
-            idx = pointops.knn_query(k, coords.contiguous(), offset)[0].long()
-            
-            # --- SAFETY CLAMP (CRITICAL) ---
-            idx = torch.clamp(idx, min=0, max=scores.shape[0] - 1)
-            
-            neighbor_scores = scores[idx] 
-            loss = F.mse_loss(scores.unsqueeze(1).expand_as(neighbor_scores), neighbor_scores)
-            return loss
-        except: return torch.tensor(0.0, device=scores.device)
+        N = scores.shape[0]
+        # GUARD 1: Not enough points to compute neighbors
+        if N < 2: 
+            return torch.tensor(0.0, device=scores.device)
+
+        # GUARD 2: Check for NaNs in coordinates which break KNN
+        if torch.isnan(coords).any():
+            return torch.tensor(0.0, device=scores.device)
+        k = min(self.ordering_k, scores.shape[0] - 1)
+        idx = pointops.knn_query(k, coords.contiguous(), offset)[0].long()
+        
+        # --- SAFETY CLAMP (CRITICAL) ---
+        idx = torch.clamp(idx, min=0, max=scores.shape[0] - 1)
+        
+        neighbor_scores = scores[idx] 
+        loss = F.mse_loss(scores.unsqueeze(1).expand_as(neighbor_scores), neighbor_scores)
+        return loss
 
     def _compute_contrastive_loss(self, scores, coords, offset):
-        try:
-            var = torch.var(scores)
-            return torch.relu(0.08 - var + 1e-6) 
-        except: return torch.tensor(0.0, device=scores.device)
+        if scores.shape[0] == 0: return torch.tensor(0.0, device=scores.device) # Add check to prevent empty input
+        var = torch.var(scores)
+        return torch.relu(0.08 - var + 1e-6) 
 
     def _compute_distribution_loss(self, scores, batch_ids):
         batch_ids_long = batch_ids.long()
@@ -304,13 +309,25 @@ class OPTNetSegmentor(nn.Module):
         self.backbone = MODELS.build(backbone)
         self.criteria = build_criteria(criteria)
         self.seg_head = nn.Linear(backbone_out_channels, num_classes)
+        self.num_classes = num_classes
 
     def forward(self, data_dict):
         point = self.backbone(data_dict)
         seg_logits = self.seg_head(point.feat)
         
         if self.training:
-            loss = self.criteria(seg_logits, data_dict["segment"])
+            target = data_dict["segment"]
+            
+            # --- SAFETY FIX: Sanitize Labels ---
+            # Map any label >= num_classes to ignore_index (-1)
+            # This handles '255' or other invalid values that crash LovaszLoss
+            if target.max() >= self.num_classes:
+                # Clone to avoid modifying original data_dict in place if shared
+                target = target.clone() 
+                target[target >= self.num_classes] = -1
+            # -----------------------------------
+
+            loss = self.criteria(seg_logits, target)
             return_dict = dict(seg_loss=loss)
             
             if "ordering_loss" in point:
