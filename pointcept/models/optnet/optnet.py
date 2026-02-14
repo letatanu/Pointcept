@@ -319,12 +319,14 @@ class OPTNetSegmentor(nn.Module):
             target = data_dict["segment"]
             
             # --- SAFETY FIX: Sanitize Labels ---
-            # Map any label >= num_classes to ignore_index (-1)
-            # This handles '255' or other invalid values that crash LovaszLoss
-            if target.max() >= self.num_classes:
-                # Clone to avoid modifying original data_dict in place if shared
-                target = target.clone() 
+            # 1. Clone to avoid in-place modification of shared data
+            # 2. Map labels >= num_classes to -1
+            # 3. CRITICAL: Map invalid negative labels (like -100) to -1
+            # This prevents 'index out of bounds' in LovaszLoss/Scatter kernels
+            if target.max() >= self.num_classes or target.min() < -1:
+                target = target.clone()
                 target[target >= self.num_classes] = -1
+                target[target < -1] = -1
             # -----------------------------------
 
             loss = self.criteria(seg_logits, target)
