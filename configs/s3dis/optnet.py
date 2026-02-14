@@ -2,11 +2,10 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 32
+batch_size = 42
 mix_prob = 0.8
 empty_cache = False
 enable_amp = True
-find_unused_parameters = False
 
 # model settings
 model = dict(
@@ -71,7 +70,7 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 800
+epoch = 3000
 eval_epoch = 100
 optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05)
 scheduler = dict(
@@ -143,7 +142,6 @@ data = dict(
             ),
         ],
         test_mode=False,
-        loop=8,  # 8 loops for 204 * 8 = 1632 samples per epoch
     ),
     val=dict(
         type=dataset_type,
