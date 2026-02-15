@@ -2,11 +2,11 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 42
+batch_size = 32
 mix_prob = 0.8
 empty_cache = False
-enable_amp = True
-
+enable_amp = False
+clip_grad = 35.0
 # model settings
 model = dict(
     type="OPTNetSegmentor",
@@ -20,6 +20,7 @@ model = dict(
         ordering_loss_weight=1.0,      # Overall weight for ordering loss
         ordering_k=16,                 # k-NN for locality loss
         warmup_epoch=0,                # Start using learned order from epoch 0
+        enable_score_concat = True, # Whether to concatenate the score to the features for the main loss
         
         # ============================================
         # NEW: Contrastive Loss Parameters
@@ -72,7 +73,7 @@ model = dict(
 # scheduler settings
 epoch = 3000
 eval_epoch = 100
-optimizer = dict(type="AdamW", lr=0.005, weight_decay=0.05)
+optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR",
     max_lr=optimizer["lr"],
