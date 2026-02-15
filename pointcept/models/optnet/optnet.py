@@ -90,7 +90,7 @@ class PointSorter(nn.Module):
             inp = point.coord
 
         inp = torch.nan_to_num(inp, nan=0.0)
-        inp = torch.clamp(inp, -10.0, 10.0) # Conservative clamp
+        inp = torch.clamp(inp, -10.0, 10.0)
 
         # 2. Predict Scores
         logits = self.mlp(inp)
@@ -108,8 +108,7 @@ class PointSorter(nn.Module):
         scores_t = scores_for_sort.transpose(0, 1)
 
         for i in range(scores_t.shape[0]):
-            # --- STABILITY FIX: Add Noise to break ties ---
-            # Tie-breaking is crucial for stable pooling and unique ranks
+            # STABILITY FIX: Add Noise to break ties
             noise = torch.rand_like(scores_t[i]) * 1e-6
             
             order = torch.argsort((scores_t[i] + noise).detach(), stable=True)
@@ -131,7 +130,6 @@ class SelfSupervisedOrderingLoss(nn.Module):
         self.ordering_k = ordering_k
         self.contrastive_k_near = contrastive_k_near
         self.contrastive_k_far = contrastive_k_far
-        
         self.temp_locality = temp_locality
         self.temp_contrastive = temp_contrastive
     
@@ -141,7 +139,6 @@ class SelfSupervisedOrderingLoss(nn.Module):
         else:
             scores_mean = scores.view(-1, 1)
         
-        # Handle NaN/Inf in scores
         scores_mean = torch.nan_to_num(scores_mean, nan=0.5)
         
         if offset is None:
@@ -155,7 +152,6 @@ class SelfSupervisedOrderingLoss(nn.Module):
         loss_contrastive = self._compute_contrastive_loss(scores_mean, coords, offset)
         loss_distribution = self._compute_distribution_loss(scores_mean, batch_ids)
         
-        # Check for NaN in losses
         if torch.isnan(loss_locality): loss_locality = torch.tensor(0.0, device=scores.device)
         if torch.isnan(loss_contrastive): loss_contrastive = torch.tensor(0.0, device=scores.device)
         if torch.isnan(loss_distribution): loss_distribution = torch.tensor(0.0, device=scores.device)
@@ -172,17 +168,11 @@ class SelfSupervisedOrderingLoss(nn.Module):
     
     def _compute_locality_loss(self, scores, coords, offset):
         N = scores.shape[0]
-        # GUARD 1: Not enough points to compute neighbors
-        if N < 2: 
-            return torch.tensor(0.0, device=scores.device)
+        if N < 2: return torch.tensor(0.0, device=scores.device)
+        if torch.isnan(coords).any(): return torch.tensor(0.0, device=scores.device)
 
-        # GUARD 2: Check for NaNs in coordinates which break KNN
-        if torch.isnan(coords).any():
-            return torch.tensor(0.0, device=scores.device)
         k = min(self.ordering_k, scores.shape[0] - 1)
         idx = pointops.knn_query(k, coords.contiguous(), offset)[0].long()
-        
-        # --- SAFETY CLAMP (CRITICAL) ---
         idx = torch.clamp(idx, min=0, max=scores.shape[0] - 1)
         
         neighbor_scores = scores[idx] 
@@ -190,7 +180,7 @@ class SelfSupervisedOrderingLoss(nn.Module):
         return loss
 
     def _compute_contrastive_loss(self, scores, coords, offset):
-        if scores.shape[0] == 0: return torch.tensor(0.0, device=scores.device) # Add check to prevent empty input
+        if scores.shape[0] == 0: return torch.tensor(0.0, device=scores.device)
         var = torch.var(scores)
         return torch.relu(0.08 - var + 1e-6) 
 
@@ -228,15 +218,22 @@ class OPTNet(PointTransformerV3):
                  contrastive_k_near=None,
                  contrastive_temp=0.5,
                  contrastive_weight=0.5,
+                 enable_score_concat=True, # New flag to enable gradient flow
                  **kwargs):
         
-        # Force Single Order Mode
         if isinstance(order, (list, tuple)):
             single_order = [order[0]]
         else:
             single_order = [order]
             
-        super().__init__(in_channels=in_channels, order=single_order, **kwargs)
+        self.enable_score_concat = enable_score_concat
+        
+        # [FEATURE CONCATENATION]: 
+        # If enabled, we append the 1-dim score to the input features.
+        # We must tell the backbone (PointTransformerV3) to expect 1 extra channel.
+        backbone_in_channels = in_channels + 1 if enable_score_concat else in_channels
+            
+        super().__init__(in_channels=backbone_in_channels, order=single_order, **kwargs)
         
         self.ordering_loss_weight = ordering_loss_weight
         self.warmup_epoch = warmup_epoch
@@ -244,6 +241,7 @@ class OPTNet(PointTransformerV3):
         if contrastive_k_near is None:
             contrastive_k_near = ordering_k
 
+        # Sorter input is strictly coordinate + original features (not concatenated yet)
         self.sorter = PointSorter(
             in_channels=in_channels + 3,
             hidden_channels=64,
@@ -267,18 +265,17 @@ class OPTNet(PointTransformerV3):
         if "serialized_depth" not in point:
              point.serialized_depth = 10 
         
-        point.sparsify()
+        # --- FIX: REMOVED EARLY SPARSIFY ---
+        # point.sparsify() was here, causing the tensor to be built with old features
         
         # 2. Run OPTNet Sorter
+        # scores: (N, 1) continuous values
         scores, learned_order, learned_inverse = self.sorter(point)
         
         # 3. Apply Order Strategy
         if not need_standard_z:
             point.serialized_order = learned_order
             point.serialized_inverse = learned_inverse
-
-            # --- POOLING COMPATIBILITY FIX ---
-            # Use Rank (inverse) with [1, N] shape.
             primary_inverse = learned_inverse[0] 
             point.serialized_code = primary_inverse.unsqueeze(0).long() 
             
@@ -290,12 +287,25 @@ class OPTNet(PointTransformerV3):
                 point.batch, 
                 point.offset
             )
-            # Clip loss to prevent gradient explosion
             loss_ord = torch.clamp(loss_ord, max=5.0) 
             point.ordering_loss = loss_ord * self.ordering_loss_weight
+
+        # [FEATURE CONCATENATION]
+        # Allow gradients to flow from backbone back to sorter via feature concatenation
+        if self.enable_score_concat:
+            if point.feat is None:
+                point.feat = scores
+            else:
+                # Concatenate scores (N,1) to features (N, C)
+                point.feat = torch.cat([point.feat, scores], dim=1)
+        
+        # --- FIX: CALL SPARSIFY HERE ---
+        # Now point.feat has C+1 channels, so sparsify() will create 
+        # a sparse tensor with C+1 channels, matching the backbone's expectation.
+        point.sparsify() 
  
         # 5. Backbone Forward
-        point = self.embedding(point)
+        point = self.embedding(point) # Embedding layer now handles C+1 channels
         point = self.enc(point)
         if not self.enc_mode:
             point = self.dec(point)
@@ -318,16 +328,13 @@ class OPTNetSegmentor(nn.Module):
         if self.training:
             target = data_dict["segment"]
             
-            # --- SAFETY FIX: Sanitize Labels ---
-            # 1. Clone to avoid in-place modification of shared data
-            # 2. Map labels >= num_classes to -1
-            # 3. CRITICAL: Map invalid negative labels (like -100) to -1
-            # This prevents 'index out of bounds' in LovaszLoss/Scatter kernels
-            if target.max() >= self.num_classes or target.min() < -1:
+            if not target.dtype == torch.int64:
+                target = target.long()
+
+            valid_mask = (target >= 0) & (target < self.num_classes)
+            if not valid_mask.all():
                 target = target.clone()
-                target[target >= self.num_classes] = -1
-                target[target < -1] = -1
-            # -----------------------------------
+                target[~valid_mask] = -1
 
             loss = self.criteria(seg_logits, target)
             return_dict = dict(seg_loss=loss)
