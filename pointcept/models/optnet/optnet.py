@@ -12,9 +12,11 @@ import torch.nn.functional as F
 class PointSorter(nn.Module):
     def __init__(self, in_channels, hidden_channels=64, num_orders=1, 
                  ordering_k=16, contrastive_k_near=16, contrastive_k_far=32,
-                 temp_locality=0.1, temp_contrastive=0.5):
+                 temp_locality=0.1, temp_contrastive=0.5,
+                 z_loss_weight=10.0): # Weight to enforce spatial structure
         super().__init__()
         self.num_orders = num_orders
+        self.z_loss_weight = z_loss_weight
         
         # Robust MLP with LayerNorm
         self.mlp = nn.Sequential(
@@ -27,6 +29,7 @@ class PointSorter(nn.Module):
             nn.Linear(hidden_channels, num_orders)
         )
 
+        # Initialize to approximate Z-order (helps convergence)
         self._zorder_init(in_channels)
         
         self.ss_loss = SelfSupervisedOrderingLoss(
@@ -92,15 +95,15 @@ class PointSorter(nn.Module):
         inp = torch.nan_to_num(inp, nan=0.0)
         inp = torch.clamp(inp, -10.0, 10.0)
 
-        # 2. Predict Scores
+        # 2. Predict Semantic Scores
         logits = self.mlp(inp)
-        scores = torch.sigmoid(logits)
-        scores = torch.clamp(scores, min=1e-5, max=1-1e-5)
+        learned_scores = torch.sigmoid(logits)
+        learned_scores = torch.clamp(learned_scores, min=1e-5, max=1-1e-5)
 
-        # 3. Generate Orders
-        # Add batch offset to sort within batches
+        # 3. Generate Orders PURELY from learned scores
+        # We do NOT add Z-score here. The network must have learned it.
         batch_offset = point.batch.unsqueeze(1) * 2.0
-        scores_for_sort = scores + batch_offset 
+        scores_for_sort = learned_scores + batch_offset 
 
         orders_list = []
         inverses_list = []
@@ -117,10 +120,25 @@ class PointSorter(nn.Module):
             orders_list.append(order)
             inverses_list.append(inverse)
 
-        return scores, torch.stack(orders_list), torch.stack(inverses_list)
+        return learned_scores, torch.stack(orders_list), torch.stack(inverses_list)
 
-    def compute_loss(self, scores, coords, batch_ids, offset):
-        return self.ss_loss(scores, coords, batch_ids, offset)
+    def compute_loss(self, scores, coords, batch_ids, offset, z_target=None):
+        # 1. Standard Self-Supervised Losses (Locality, etc.)
+        total_loss, loss_dict = self.ss_loss(scores, coords, batch_ids, offset)
+        
+        # 2. Z-Order Regression Loss
+        # Forces the network to learn spatial structure
+        loss_z = torch.tensor(0.0, device=scores.device)
+        if z_target is not None:
+            scores_flat = scores.view(-1, 1)
+            z_target_flat = z_target.view(-1, 1)
+            
+            loss_z = F.mse_loss(scores_flat, z_target_flat) * self.z_loss_weight
+            
+            total_loss += loss_z
+            loss_dict["z_regression"] = loss_z.item()
+            
+        return total_loss, loss_dict
 
 
 class SelfSupervisedOrderingLoss(nn.Module):
@@ -218,7 +236,8 @@ class OPTNet(PointTransformerV3):
                  contrastive_k_near=None,
                  contrastive_temp=0.5,
                  contrastive_weight=0.5,
-                 enable_score_concat=True, # New flag to enable gradient flow
+                 enable_score_concat=True, 
+                 z_loss_weight=10.0, # Strong supervision for Z-order
                  **kwargs):
         
         if isinstance(order, (list, tuple)):
@@ -229,8 +248,6 @@ class OPTNet(PointTransformerV3):
         self.enable_score_concat = enable_score_concat
         
         # [FEATURE CONCATENATION]: 
-        # If enabled, we append the 1-dim score to the input features.
-        # We must tell the backbone (PointTransformerV3) to expect 1 extra channel.
         backbone_in_channels = in_channels + 1 if enable_score_concat else in_channels
             
         super().__init__(in_channels=backbone_in_channels, order=single_order, **kwargs)
@@ -241,7 +258,6 @@ class OPTNet(PointTransformerV3):
         if contrastive_k_near is None:
             contrastive_k_near = ordering_k
 
-        # Sorter input is strictly coordinate + original features (not concatenated yet)
         self.sorter = PointSorter(
             in_channels=in_channels + 3,
             hidden_channels=64,
@@ -249,29 +265,21 @@ class OPTNet(PointTransformerV3):
             ordering_k=ordering_k,
             contrastive_k_near=contrastive_k_near,
             contrastive_k_far=contrastive_k_far,
-            temp_contrastive=contrastive_temp
+            temp_contrastive=contrastive_temp,
+            z_loss_weight=z_loss_weight
         )
 
     def forward(self, data_dict):
         point = Point(data_dict)
         current_epoch = data_dict.get("epoch", 0) if self.training else float('inf')
-        
         need_standard_z = current_epoch < self.warmup_epoch
 
-        point.serialization(order=self.order, 
-                            shuffle_orders=self.shuffle_orders, 
-                            compute_codes=True) 
-        
-        if "serialized_depth" not in point:
-             point.serialized_depth = 10 
-        
-        # --- FIX: REMOVED EARLY SPARSIFY ---
-        # point.sparsify() was here, causing the tensor to be built with old features
-        
+        point.serialization(compute_codes=False) 
+
         # 2. Run OPTNet Sorter
-        # scores: (N, 1) continuous values
-        scores, learned_order, learned_inverse = self.sorter(point)
-        
+        # NOTE: We do NOT pass Z-score as input. Network must learn it.
+        learned_scores, learned_order, learned_inverse = self.sorter(point)
+
         # 3. Apply Order Strategy
         if not need_standard_z:
             point.serialized_order = learned_order
@@ -280,32 +288,41 @@ class OPTNet(PointTransformerV3):
             point.serialized_code = primary_inverse.unsqueeze(0).long() 
             
         # 4. Calculate Loss
+        # We pass z_score_target here so the loss can force learned_scores to approximate it
         if self.training and self.ordering_loss_weight > 0:
+
+            # 1. Compute Standard Z-Order (Used for training target)
+            point.serialization(order=self.order, 
+                                shuffle_orders=self.shuffle_orders, 
+                                compute_codes=True) 
+            
+            # Extract Z-Score as Training Target
+            z_code = point.serialized_code.float()
+            z_score_target = (z_code - z_code.min()) / (z_code.max() - z_code.min() + 1e-6)
+
             loss_ord, loss_dict = self.sorter.compute_loss(
-                scores, 
+                learned_scores, 
                 point.coord, 
                 point.batch, 
-                point.offset
+                point.offset,
+                z_target=z_score_target # Supervise with Z-order
             )
-            loss_ord = torch.clamp(loss_ord, max=5.0) 
+            # Relax clip slightly to allow learning trend
+            loss_ord = torch.clamp(loss_ord, max=10.0) 
             point.ordering_loss = loss_ord * self.ordering_loss_weight
 
         # [FEATURE CONCATENATION]
-        # Allow gradients to flow from backbone back to sorter via feature concatenation
         if self.enable_score_concat:
             if point.feat is None:
-                point.feat = scores
+                point.feat = learned_scores
             else:
-                # Concatenate scores (N,1) to features (N, C)
-                point.feat = torch.cat([point.feat, scores], dim=1)
+                point.feat = torch.cat([point.feat, learned_scores], dim=1)
         
-        # --- FIX: CALL SPARSIFY HERE ---
-        # Now point.feat has C+1 channels, so sparsify() will create 
-        # a sparse tensor with C+1 channels, matching the backbone's expectation.
+        # 5. Late Sparsify
         point.sparsify() 
  
-        # 5. Backbone Forward
-        point = self.embedding(point) # Embedding layer now handles C+1 channels
+        # 6. Backbone Forward
+        point = self.embedding(point) 
         point = self.enc(point)
         if not self.enc_mode:
             point = self.dec(point)
