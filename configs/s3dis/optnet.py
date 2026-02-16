@@ -2,7 +2,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 32
+batch_size = 24
 mix_prob = 0.8
 empty_cache = False
 enable_amp = False
