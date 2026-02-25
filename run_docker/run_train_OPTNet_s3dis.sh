@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="0,1"
+DEVICES="1"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -13,7 +13,7 @@ DOCKER_IMAGE="letatanu/poincept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="optnet"
-EXP_NAME="optnet_ptv3_05"
+EXP_NAME="optnet_1dpooling_03"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
 echo "Model Name: $MODEL_NAME"

@@ -2,10 +2,11 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 24
+batch_size = 12
 mix_prob = 0.8
 empty_cache = False
-enable_amp = False
+enable_amp = True  # False → True
+amp_dtype = 'bfloat16'  # More stable than float16 on A100/H100
 clip_grad = 35.0
 # model settings
 model = dict(
@@ -19,15 +20,10 @@ model = dict(
         # ============================================
         ordering_loss_weight=1.0,      # Overall weight for ordering loss
         ordering_k=16,                 # k-NN for locality loss
-        warmup_epoch=0,                # Start using learned order from epoch 0
+        warmup_epoch=5,                # Start using learned order from epoch 0
         enable_score_concat = True, # Whether to concatenate the score to the features for the main loss
-        
-        # ============================================
-        # NEW: Contrastive Loss Parameters
-        # ============================================
-        contrastive_k_far=32,          # k for far neighbors (recommend 32-48)
-        contrastive_temp=0.5,          # Temperature for contrastive loss (0.3-0.7)
-        contrastive_weight=0.5,        # Weight for contrastive component (0.3-0.8)
+        tau=0.1,                    # Temperature for global feature contrastive loss
+        loss_weights=[0, 0, 1, 1],   # Only global feature loss for now (locality losses set to 0)
         
         # ============================================
         # PTv3 Backbone Parameters
@@ -47,8 +43,7 @@ model = dict(
         qk_scale=None,
         attn_drop=0.0,
         proj_drop=0.0,
-        drop_path=0.3,
-        shuffle_orders=True,
+        drop_path=0.1,
         pre_norm=True,
         enable_rpe=False,
         enable_flash=True,

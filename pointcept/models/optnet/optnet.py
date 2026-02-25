@@ -9,343 +9,806 @@ import pointops
 import torch.nn.init as init
 import torch.nn.functional as F
 
-class PointSorter(nn.Module):
-    def __init__(self, in_channels, hidden_channels=64, num_orders=1, 
-                 ordering_k=16, contrastive_k_near=16, contrastive_k_far=32,
-                 temp_locality=0.1, temp_contrastive=0.5,
-                 z_loss_weight=10.0): # Weight to enforce spatial structure
+
+
+from pointcept.models.utils.structure import Point
+from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import SerializedPooling
+
+class SortedWindowPooling(nn.Module):
+    """
+    O(N) pooling directly on the 1D sorted order from PointSorter.
+    
+    Valid because _locality_loss enforces:  score_neighbors ≈ score_i
+    → consecutive points in sorted order ARE 3D spatial neighbors.
+    
+    Every `pool_size` consecutive sorted points → 1 super-point.
+    No grid hashing, no scatter, no kNN — just reshape + mean.
+    """
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        pool_size=8,        # 8 ≈ stride=2 in PTv3 octree (2^3 = 8 cells merged)
+        code_depth=10,
+        traceable=True,
+        norm_layer=nn.LayerNorm,
+        act_layer=nn.GELU,
+    ):
         super().__init__()
-        self.num_orders = num_orders
-        self.z_loss_weight = z_loss_weight
-        
-        # Robust MLP with LayerNorm
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, hidden_channels),
-            nn.LayerNorm(hidden_channels), 
-            nn.GELU(),
-            nn.Linear(hidden_channels, hidden_channels),
-            nn.LayerNorm(hidden_channels),
-            nn.GELU(),
-            nn.Linear(hidden_channels, num_orders)
+        self.pool_size = pool_size
+        self.code_depth = code_depth
+        self.traceable = traceable
+        self.proj = nn.Linear(in_channels, out_channels, bias=False)
+        self.norm = norm_layer(out_channels)
+        self.act = act_layer()
+
+    def forward(self, point: Point):
+        order = point.serialized_order[0]   # [N]: sorted_pos → orig_idx
+        P = self.pool_size
+        device = order.device
+
+        # ------------------------------------------------------------------
+        # 1. Batch-safe clipping
+        # Batch index lives in high bits of serialized_code, so sorted order
+        # naturally groups per-batch. We clip each batch's tail to a multiple
+        # of P to avoid cross-batch window pollution.
+        # ------------------------------------------------------------------
+        sorted_batch = point.batch[order]
+        _, counts = torch.unique_consecutive(sorted_batch, return_counts=True)
+        per_batch_valid = (counts // P) * P        # floor to multiple of P
+        valid_ends = torch.cumsum(per_batch_valid, dim=0)
+        valid_starts = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=device), valid_ends[:-1]
+        ])
+
+        valid_orig_idx = torch.cat([
+            order[valid_starts[b]:valid_ends[b]]
+            for b in range(len(counts))
+            if valid_ends[b] > valid_starts[b]
+        ], dim=0)                                   # [N_valid]
+
+        N_valid = valid_orig_idx.shape[0]
+        n_groups = N_valid // P
+
+        # ------------------------------------------------------------------
+        # 2. Pool features: sort → reshape → mean  (the key O(N) operation)
+        # ------------------------------------------------------------------
+        sorted_feat = point.feat[valid_orig_idx]                    # [N_valid, C_in]
+        pooled_feat = sorted_feat.view(n_groups, P, -1).mean(dim=1) # [n_groups, C_in]
+
+        # ------------------------------------------------------------------
+        # 3. Representative point per group (center of window)
+        # ------------------------------------------------------------------
+        center_pos = torch.arange(n_groups, device=device) * P + (P // 2)
+        center_orig_idx = valid_orig_idx[center_pos]               # [n_groups]
+
+        # ------------------------------------------------------------------
+        # 4. Build new Point
+        # ------------------------------------------------------------------
+        new_point = Point()
+        new_point.coord      = point.coord[center_orig_idx]
+        new_point.grid_coord = torch.div(
+            point.grid_coord[center_orig_idx], P, rounding_mode='floor'
+        )
+        new_point.batch  = point.batch[center_orig_idx]
+        new_point.offset = pointops.compute_offset(new_point.batch)
+        new_point.feat   = self.act(self.norm(self.proj(pooled_feat)))
+
+        # ------------------------------------------------------------------
+        # 5. Pool scores → re-serialize for next Transformer block
+        # ------------------------------------------------------------------
+        sorted_scores  = point.scores[valid_orig_idx]                    # [N_valid, 1]
+        pooled_scores  = sorted_scores.view(n_groups, P, -1).mean(dim=1) # [n_groups, 1]
+        new_point.scores = pooled_scores
+
+        code       = scores_to_hierarchical_code(pooled_scores, new_point.batch, depth=self.code_depth)
+        code_2d    = code.unsqueeze(0)
+        new_order  = torch.argsort(code_2d, dim=1)
+        new_inverse = torch.zeros_like(new_order).scatter_(
+            1, new_order,
+            torch.arange(new_order.shape[1], device=device).unsqueeze(0).expand_as(new_order)
+        )
+        new_point.serialized_code    = code_2d
+        new_point.serialized_order   = new_order
+        new_point.serialized_inverse = new_inverse
+        new_point.serialized_depth   = self.code_depth
+
+        # ------------------------------------------------------------------
+        # 6. Traceability for decoder unpooling
+        # ------------------------------------------------------------------
+        if self.traceable:
+            group_ids        = torch.arange(n_groups, device=device).repeat_interleave(P)
+            pooling_inverse  = torch.full((order.shape[0],), n_groups - 1,
+                                          dtype=torch.long, device=device)
+            pooling_inverse[valid_orig_idx] = group_ids
+            new_point.pooling_inverse = pooling_inverse
+            new_point.pooling_parent  = point
+
+        return new_point
+
+class GridPoolingLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=2, code_depth=10,
+                 norm_layer=nn.LayerNorm, act_layer=nn.GELU, traceable=True):
+        super().__init__()
+        self.stride = stride
+        self.code_depth = code_depth
+        self.traceable = traceable
+        self.proj = nn.Linear(in_channels, out_channels, bias=False)
+        self.norm = norm_layer(out_channels)
+        self.act = act_layer()
+
+    def forward(self, point: Point):
+        # 1. Geometric downsampling
+        new_grid_coord = torch.div(point.grid_coord, self.stride, rounding_mode='floor')
+        cluster_idx, unique_idx = pointops.unique_and_cluster(new_grid_coord, point.batch)
+
+        # 2. Build new Point (coord/batch from representative points)
+        new_point = Point()
+        new_point.grid_coord = new_grid_coord[unique_idx]
+        new_point.coord      = point.coord[unique_idx]
+        new_point.batch      = point.batch[unique_idx]
+        new_point.offset     = pointops.compute_offset(new_point.batch)
+
+        # 3. Pool features
+        pooled_feat    = pointops.scatter_mean(point.feat, cluster_idx, dim=0)
+        new_point.feat = self.act(self.norm(self.proj(pooled_feat)))
+
+        # 4. ← KEY: Reuse existing codes directly from _build_serialization_from_scores
+        #    unique_idx are the representative points — their codes are already computed.
+        #    No need to re-run scores_to_hierarchical_code.
+        existing_codes = point.serialized_code[0][unique_idx]   # [n_new_points]
+
+        code_2d     = existing_codes.unsqueeze(0)
+        new_order   = torch.argsort(code_2d, dim=1)
+        new_inverse = torch.zeros_like(new_order).scatter_(
+            1, new_order,
+            torch.arange(new_order.shape[1], device=new_order.device)
+                .unsqueeze(0).expand_as(new_order)
         )
 
-        # Initialize to approximate Z-order (helps convergence)
-        self._zorder_init(in_channels)
-        
-        self.ss_loss = SelfSupervisedOrderingLoss(
-            ordering_k=ordering_k, 
-            contrastive_k_near=contrastive_k_near,
-            contrastive_k_far=contrastive_k_far, 
-            temp_locality=temp_locality, 
-            temp_contrastive=temp_contrastive
-        )
+        new_point.serialized_code    = code_2d
+        new_point.serialized_order   = new_order
+        new_point.serialized_inverse = new_inverse
+        new_point.serialized_depth   = self.code_depth
 
-    def _zorder_init(self, in_channels):
-        device = next(self.parameters()).device if list(self.parameters()) else 'cpu'
-        
-        for layer in self.mlp[:-1]:
-            if isinstance(layer, nn.Linear):
-                init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
-                if layer.bias is not None: init.zeros_(layer.bias)
+        # 5. Traceability for decoder unpooling
+        if self.traceable:
+            new_point.pooling_inverse = cluster_idx
+            new_point.pooling_parent  = point
 
-        N = 4096
-        depth = 10
-        grid_scale = 1023
-        dummy_grid = torch.randint(0, grid_scale + 1, (N, 3), device=device).int()
-        dummy_batch = torch.zeros(N, device=device).long()
-        dummy_coords = (dummy_grid.float() / grid_scale) * 2 - 1
-        
-        if in_channels > 3:
-            dummy_feats = torch.zeros(N, in_channels - 3, device=device)
-            dummy_inp = torch.cat([dummy_coords, dummy_feats], dim=1)
-        else:
-            dummy_inp = dummy_coords
+        return new_point
 
-        z_key = encode(dummy_grid, dummy_batch, depth, order="z")
-        z_scores = (z_key.float() - z_key.float().min()) / (z_key.float().max() - z_key.float().min() + 1e-6)
-        z_scores = z_scores * 0.98 + 0.01
-        target_logit = torch.log(z_scores / (1 - z_scores)).unsqueeze(1)
+# ---------------------------------------------------------------------------
+# Helper: score → hierarchical integer code
+# ---------------------------------------------------------------------------
 
-        with torch.no_grad():
-            feat = dummy_inp
-            for layer in self.mlp[:-1]:
-                feat = layer(feat)
-            
-            feat_mean = feat.mean(dim=0)
-            target_mean = target_logit.mean(dim=0)
-            feat_c = feat - feat_mean
-            target_c = target_logit - target_mean
-            
-            I = torch.eye(feat_c.shape[1], device=device) * 1e-3
-            weight = torch.linalg.solve(feat_c.T @ feat_c + I, feat_c.T @ target_c).T
-            bias = target_mean - weight @ feat_mean
-
-            last_layer = self.mlp[-1]
-            out_dim = last_layer.weight.shape[0]
-            last_layer.weight.copy_(weight.repeat(out_dim, 1))
-            last_layer.bias.copy_(bias.repeat(out_dim))
-
-    def forward(self, point):
-        # 1. Prepare Input (Handle NaNs early)
-        if point.feat is not None:
-            inp = torch.cat([point.coord, point.feat], dim=1)
-        else:
-            inp = point.coord
-
-        inp = torch.nan_to_num(inp, nan=0.0)
-        inp = torch.clamp(inp, -10.0, 10.0)
-
-        # 2. Predict Semantic Scores
-        logits = self.mlp(inp)
-        learned_scores = torch.sigmoid(logits)
-        learned_scores = torch.clamp(learned_scores, min=1e-5, max=1-1e-5)
-
-        # 3. Generate Orders PURELY from learned scores
-        # We do NOT add Z-score here. The network must have learned it.
-        batch_offset = point.batch.unsqueeze(1) * 2.0
-        scores_for_sort = learned_scores + batch_offset 
-
-        orders_list = []
-        inverses_list = []
-        
-        scores_t = scores_for_sort.transpose(0, 1)
-
-        for i in range(scores_t.shape[0]):
-            # STABILITY FIX: Add Noise to break ties
-            noise = torch.rand_like(scores_t[i]) * 1e-6
-            
-            order = torch.argsort((scores_t[i] + noise).detach(), stable=True)
-            inverse = torch.zeros_like(order)
-            inverse[order] = torch.arange(len(order), device=order.device)
-            orders_list.append(order)
-            inverses_list.append(inverse)
-
-        return learned_scores, torch.stack(orders_list), torch.stack(inverses_list)
-
-    def compute_loss(self, scores, coords, batch_ids, offset, z_target=None):
-        # 1. Standard Self-Supervised Losses (Locality, etc.)
-        total_loss, loss_dict = self.ss_loss(scores, coords, batch_ids, offset)
-        
-        # 2. Z-Order Regression Loss
-        # Forces the network to learn spatial structure
-        loss_z = torch.tensor(0.0, device=scores.device)
-        if z_target is not None:
-            scores_flat = scores.view(-1, 1)
-            z_target_flat = z_target.view(-1, 1)
-            
-            loss_z = F.mse_loss(scores_flat, z_target_flat) * self.z_loss_weight
-            
-            total_loss += loss_z
-            loss_dict["z_regression"] = loss_z.item()
-            
-        return total_loss, loss_dict
+def scores_to_hierarchical_code(scores, batch, depth=10):
+    """
+    Quantize scores [0,1] to depth*3 bits and pack with batch index.
+    Compatible with PTv3's SerializedPooling which does code >> (k*3).
+    With depth=10: 2^30 levels, rank(code)==rank(score), no ties for N<1B.
+    """
+    scores_flat = scores.view(-1)
+    max_code    = (1 << (depth * 3)) - 1
+    quantized   = (scores_flat * max_code).long().clamp(0, max_code)
+    code        = batch.long() << (depth * 3) | quantized
+    return code
 
 
-class SelfSupervisedOrderingLoss(nn.Module):
-    def __init__(self, ordering_k=16, contrastive_k_near=16, contrastive_k_far=32, 
-                 temp_locality=0.1, temp_contrastive=0.5):
+# ---------------------------------------------------------------------------
+# Ordering Loss  (locality + distribution + Z-regression, no contrastive)
+# ---------------------------------------------------------------------------
+
+class OrderingLoss(nn.Module):
+    def __init__(self, ordering_k=16, loss_weights=[0,0,0,1], tau=0.1):
         super().__init__()
         self.ordering_k = ordering_k
-        self.contrastive_k_near = contrastive_k_near
-        self.contrastive_k_far = contrastive_k_far
-        self.temp_locality = temp_locality
-        self.temp_contrastive = temp_contrastive
-    
-    def forward(self, scores, coords, batch_ids, offset=None):
-        if scores.dim() > 1 and scores.shape[1] > 1:
-            scores_mean = scores.mean(dim=1, keepdim=True)
-        else:
-            scores_mean = scores.view(-1, 1)
-        
-        scores_mean = torch.nan_to_num(scores_mean, nan=0.5)
-        
-        if offset is None:
-            batch_ids_long = batch_ids.long()
-            _, counts = torch.unique_consecutive(batch_ids_long, return_counts=True)
-            offset = torch.cumsum(counts, dim=0).int()
-        else:
-            offset = offset.int()
-        
-        loss_locality = self._compute_locality_loss(scores_mean, coords, offset)
-        loss_contrastive = self._compute_contrastive_loss(scores_mean, coords, offset)
-        loss_distribution = self._compute_distribution_loss(scores_mean, batch_ids)
-        
-        if torch.isnan(loss_locality): loss_locality = torch.tensor(0.0, device=scores.device)
-        if torch.isnan(loss_contrastive): loss_contrastive = torch.tensor(0.0, device=scores.device)
-        if torch.isnan(loss_distribution): loss_distribution = torch.tensor(0.0, device=scores.device)
+        # Unpack the list: [locality, distribution, z_regression, global_feature]
+        self.w_loc, self.w_dist, self.w_z, self.w_glob = loss_weights
+        self.tau = tau
 
-        total_loss = (1.0 * loss_locality + 
-                      0.5 * loss_contrastive + 
-                      1.0 * loss_distribution)
-        
-        return total_loss, {
-            "locality": loss_locality.item(),
-            "contrastive": loss_contrastive.item(),
-            "distribution": loss_distribution.item()
-        }
-    
-    def _compute_locality_loss(self, scores, coords, offset):
+    def forward(self, scores, coords, batch_ids, offset, z_target=None, features=None):
+        scores_1d = scores.view(-1, 1)
+        total = torch.tensor(0.0, device=scores.device)
+        loss_dict = {}
+
+        # 1. Locality Loss
+        if self.w_loc > 0:
+            if offset is None:
+                _, counts = torch.unique_consecutive(batch_ids.long(), return_counts=True)
+                offset = torch.cumsum(counts, dim=0).int()
+            else:
+                offset = offset.int()
+
+            loss_locality = self._locality_loss(scores_1d, coords, offset) * self.w_loc
+            total = total + loss_locality
+            loss_dict["locality"] = loss_locality.item()
+
+        # 2. Distribution Loss
+        if self.w_dist > 0:
+            loss_distribution = self._distribution_loss(scores_1d, batch_ids) * self.w_dist
+            total = total + loss_distribution
+            loss_dict["distribution"] = loss_distribution.item()
+
+        # 3. Z-Regression Loss
+        if z_target is not None and self.w_z > 0:
+            s = scores_1d.squeeze(1)
+            if z_target.dim() == 1:
+                best_target = z_target
+            else:
+                with torch.no_grad():
+                    mse_per_order = ((z_target - s.unsqueeze(0)) ** 2).mean(dim=1)
+                    best_k = mse_per_order.argmin()
+                best_target = z_target[best_k]
+
+            loss_z = F.mse_loss(s, best_target) * self.w_z
+            if not torch.isnan(loss_z):
+                total = total + loss_z
+                loss_dict["z_regression"] = loss_z.item()
+
+        # 4. Global Feature Loss (ICCV 2023)
+        if features is not None and self.w_glob > 0:
+            loss_global = self._global_feature_loss(scores_1d, features, batch_ids) * self.w_glob
+            total = total + loss_global
+            loss_dict["global_feature"] = loss_global.item()
+
+        return total, loss_dict
+
+    def _locality_loss(self, scores, coords, offset):
         N = scores.shape[0]
-        if N < 2: return torch.tensor(0.0, device=scores.device)
-        if torch.isnan(coords).any(): return torch.tensor(0.0, device=scores.device)
-
-        k = min(self.ordering_k, scores.shape[0] - 1)
+        if N < 2 or torch.isnan(coords).any():
+            return torch.tensor(0.0, device=scores.device)
+        k = min(self.ordering_k, N - 1)
         idx = pointops.knn_query(k, coords.contiguous(), offset)[0].long()
-        idx = torch.clamp(idx, min=0, max=scores.shape[0] - 1)
-        
-        neighbor_scores = scores[idx] 
-        loss = F.mse_loss(scores.unsqueeze(1).expand_as(neighbor_scores), neighbor_scores)
-        return loss
+        idx = torch.clamp(idx, 0, N - 1)
+        neighbor_scores = scores[idx]
+        return F.mse_loss(scores.unsqueeze(1).expand_as(neighbor_scores), neighbor_scores)
 
-    def _compute_contrastive_loss(self, scores, coords, offset):
-        if scores.shape[0] == 0: return torch.tensor(0.0, device=scores.device)
-        var = torch.var(scores)
-        return torch.relu(0.08 - var + 1e-6) 
-
-    def _compute_distribution_loss(self, scores, batch_ids):
+    def _distribution_loss(self, scores, batch_ids):
         batch_ids_long = batch_ids.long()
-        num_batches = batch_ids_long.max().item() + 1
-        total_loss = 0.0
+        num_batches = int(batch_ids_long.max().item()) + 1
+        total = torch.tensor(0.0, device=scores.device)
         count = 0
-        
         for b in range(num_batches):
             mask = (batch_ids_long == b)
-            if mask.sum() < 2: continue
-            
+            if mask.sum() < 2:
+                continue
             scores_b = scores[mask].flatten()
-            M = scores_b.shape[0]
-            
             sorted_scores, _ = torch.sort(scores_b)
-            target = torch.linspace(0, 1, M, device=scores.device)
-            loss_b = F.l1_loss(sorted_scores, target)
-            total_loss += loss_b
+            target = torch.linspace(0, 1, scores_b.shape[0], device=scores.device)
+            total = total + F.l1_loss(sorted_scores, target)
             count += 1
-            
-        return total_loss / max(count, 1)
+        return total / max(count, 1)
 
+    def _global_feature_loss(self, scores, features, batch_ids):
+        """
+        Computes the global feature contribution loss.
+        Target score for point i: 
+        s_target = mean( 2 * sigmoid( (f_i - F_global) / tau ) )
+        """
+        batch_ids_long = batch_ids.long()
+        num_batches = int(batch_ids_long.max().item()) + 1
+        
+        # 1. Compute global feature per batch (Max Pooling)
+        global_max = torch.empty((num_batches, features.shape[1]), device=features.device)
+        for b in range(num_batches):
+            mask = batch_ids_long == b
+            if mask.any():
+                global_max[b] = features[mask].max(dim=0)[0]
+            else:
+                global_max[b] = 0.0
+                
+        # 2. Expand global feature to per-point shape [N, D]
+        g = global_max[batch_ids_long]  
+        
+        # 3. Compute the normalized difference between point feature and global feature
+        # The paper uses tau (temperature) to scale the difference before sigmoid
+        diff = (features - g) / self.tau
+        
+        # 4. Map the difference to [0, 1] using Sigmoid, scaled by 2 as per ICCV'23
+        # Then average across all feature dimensions (D) to get a single scalar target per point
+        target_scores = (2.0 * torch.sigmoid(diff)).mean(dim=1, keepdim=True)
+        
+        # 5. The loss is the MSE between the Sorter's predicted scores and the target feature difference
+        return F.mse_loss(scores, target_scores.detach())
+
+
+
+
+# ---------------------------------------------------------------------------
+# PointSorter
+# ---------------------------------------------------------------------------
+
+# class PointSorter(nn.Module):
+#     """
+#     Predicts a scalar score per point.
+
+#     Input: point.feat  — already = coord(3) + color(3) = 6 channels
+#            (set by feat_keys=('coord', 'color') in the dataset config)
+
+#     During training, GT segment labels are fused residually.
+#     """
+
+#     def __init__(
+#         self,
+#         in_channels=6,     # == len(feat_keys) channels: coord(3)+color(3)
+#         hidden_channels=64,
+#         ordering_k=16,
+#         z_loss_weight=10.0,
+#         num_classes=13,
+#     ):
+#         super().__init__()
+#         self.num_classes = num_classes
+
+#         self.mlp_shared = nn.Sequential(
+#             nn.Linear(in_channels, hidden_channels),
+#             nn.LayerNorm(hidden_channels),
+#             nn.GELU(),
+#             nn.Linear(hidden_channels, hidden_channels),
+#             nn.LayerNorm(hidden_channels),
+#             nn.GELU(),
+#         )
+
+#         self.label_proj = nn.Sequential(
+#             nn.Linear(num_classes, hidden_channels),
+#             nn.GELU(),
+#         )
+
+#         self.score_head = nn.Linear(hidden_channels, 1)
+
+#         self.ordering_loss = OrderingLoss(
+#             ordering_k=ordering_k,
+#             z_loss_weight=z_loss_weight,
+#         )
+
+#         self._zorder_init(in_channels, hidden_channels)
+
+#     def _zorder_init(self, in_channels, hidden_channels):
+#         device = next(self.parameters()).device \
+#             if list(self.parameters()) else 'cpu'
+
+#         for layer in self.mlp_shared:
+#             if isinstance(layer, nn.Linear):
+#                 init.kaiming_normal_(layer.weight, mode='fan_in',
+#                                      nonlinearity='relu')
+#                 if layer.bias is not None:
+#                     init.zeros_(layer.bias)
+
+#         N, depth, grid_scale = 4096, 10, 1023
+#         dummy_grid   = torch.randint(0, grid_scale + 1, (N, 3), device=device).int()
+#         dummy_batch  = torch.zeros(N, device=device).long()
+#         dummy_coords = (dummy_grid.float() / grid_scale) * 2 - 1
+
+#         # dummy input matching point.feat layout: coord(3) + zeros for rest
+#         dummy_inp = torch.cat(
+#             [dummy_coords,
+#              torch.zeros(N, in_channels - 3, device=device)],
+#             dim=1
+#         ) if in_channels > 3 else dummy_coords
+
+#         z_key    = encode(dummy_grid, dummy_batch, depth, order="z")
+#         z_scores = (z_key.float() - z_key.float().min()) / \
+#                    (z_key.float().max() - z_key.float().min() + 1e-6)
+#         z_scores     = z_scores * 0.98 + 0.01
+#         target_logit = torch.log(z_scores / (1 - z_scores)).unsqueeze(1)
+
+#         with torch.no_grad():
+#             feat = dummy_inp
+#             for layer in self.mlp_shared:
+#                 feat = layer(feat)
+
+#             feat_mean   = feat.mean(dim=0)
+#             target_mean = target_logit.mean(dim=0)
+#             feat_c      = feat - feat_mean
+#             target_c    = target_logit - target_mean
+
+#             I      = torch.eye(feat_c.shape[1], device=device) * 1e-3
+#             weight = torch.linalg.solve(
+#                 feat_c.T @ feat_c + I, feat_c.T @ target_c).T
+#             bias   = target_mean - weight @ feat_mean
+
+#             self.score_head.weight.copy_(weight)
+#             self.score_head.bias.copy_(bias.squeeze())
+
+#     def forward(self, point, segment=None):
+#         # point.feat = coord(3) + color(3) = 6 channels — use directly
+#         inp = point.feat if point.feat is not None else point.coord
+#         inp = torch.nan_to_num(inp, nan=0.0)
+#         inp = torch.clamp(inp, -10.0, 10.0)
+
+#         feat = self.mlp_shared(inp)                          # [N, hidden]
+
+#         # Residual semantic fusion during training
+#         if segment is not None and self.training:
+#             seg_clamped = segment.clamp(0, self.num_classes - 1)
+#             valid       = (segment >= 0)
+#             one_hot     = F.one_hot(seg_clamped, self.num_classes).float()
+#             one_hot[~valid] = 0.0
+#             feat = feat + self.label_proj(one_hot)
+
+#         logits         = self.score_head(feat)
+#         learned_scores = torch.sigmoid(logits)
+#         learned_scores = torch.clamp(learned_scores, min=1e-5, max=1 - 1e-5)
+#         return learned_scores                                 # [N, 1]
+
+#     def compute_loss(self, scores, coords, batch_ids, offset, z_target=None):
+#         return self.ordering_loss(
+#             scores, coords, batch_ids, offset, z_target=z_target)
+
+
+class FourierEmbedding(nn.Module):
+    def __init__(self, in_channels=3, num_freqs=10, max_freq_log2=None):
+        """
+        Projects coords into high-freq features: [sin(2^0 pi x), cos(2^0 pi x), ...]
+        Essential for learning space-filling curves (Z-order/Hilbert).
+        """
+        super().__init__()
+        self.in_channels = in_channels
+        self.num_freqs = num_freqs
+        
+        if max_freq_log2 is None:
+            max_freq_log2 = num_freqs - 1
+            
+        # Frequencies: 2^0, 2^1, ..., 2^(L-1)
+        self.freq_bands = 2.0 ** torch.linspace(
+            0.0, max_freq_log2, steps=num_freqs
+        )
+
+    def forward(self, x):
+        # x: [N, 3]
+        # output: [N, 3 + 3 * 2 * num_freqs]
+        
+        embed = [x]
+        for freq in self.freq_bands.to(x.device):
+            embed.append(torch.sin(x * freq * torch.pi))
+            embed.append(torch.cos(x * freq * torch.pi))
+            
+        return torch.cat(embed, dim=-1)
+
+
+class ResidualBlock(nn.Module):
+    """Simple ResNet block for better gradient flow."""
+    def __init__(self, channels):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels),
+            nn.LayerNorm(channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+            nn.LayerNorm(channels)
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.fc(x))
+
+
+class PointSorter(nn.Module):
+    """
+    Upgraded Sorter with Fourier Embeddings + ResNet.
+    Input: point.feat (coord + color)
+    """
+
+    def __init__(
+        self,
+        in_channels=6,      # coord(3) + color(3)
+        hidden_channels=128, # Increased width for capacity
+        ordering_k=16,
+        loss_weights=[0,0,0,1], # Only global feature loss for now
+        tau=0.1,
+        num_classes=13,
+        num_freqs=10,       # 10 freqs cover grid resolution ~1024 (2^10)
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+
+        # 1. Coordinate Encoding
+        # Maps 3 coords -> 3 + 60 = 63 dims
+        self.pos_enc = FourierEmbedding(in_channels=3, num_freqs=num_freqs)
+        embed_dim = 3 + (3 * 2 * num_freqs)
+        
+        # 2. Input Projection
+        # We process (encoded_coord) and (color) together
+        # in_channels - 3 gives us the color channel count
+        self.input_proj = nn.Linear(embed_dim + (in_channels - 3), hidden_channels)
+        
+        # 3. Residual Backbone (3 blocks)
+        self.backbone = nn.Sequential(
+            nn.LayerNorm(hidden_channels),
+            nn.GELU(),
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels),
+            ResidualBlock(hidden_channels),
+        )
+
+        # # 4. Semantic Fusion (Training only)
+        # self.label_proj = nn.Sequential(
+        #     nn.Linear(num_classes, hidden_channels),
+        #     nn.GELU(),
+        # )
+
+        # 5. Head
+        self.score_head = nn.Linear(hidden_channels, 1)
+
+        # Loss
+        self.ordering_loss = OrderingLoss(
+            ordering_k=ordering_k,
+            loss_weights=loss_weights,
+            tau=tau
+        )
+
+        # We skip the heavy solver init now, standard initialization works 
+        # better with residual connections + PE.
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    def forward(self, point):
+        # 1. Split coord and color
+        # point.feat is [coord(3), color(3)]
+        coords = point.coord
+        if point.feat is not None:
+            colors = point.feat[:, 3:6]  # Assuming color channels are after the first 3 coord channels
+        else:
+            colors = torch.zeros(coords.shape[0], 0, device=coords.device)
+        
+
+        # 2. Fourier Encode Coords
+        # [N, 3] -> [N, 63]
+        pos_feat = self.pos_enc(coords)
+
+        # 3. Fuse with Color
+        # [N, 63 + 3] -> [N, hidden]
+        inp = torch.cat([pos_feat, colors], dim=1)
+        feat = self.input_proj(inp)
+
+        # 4. Residual Backbone
+        feat = self.backbone(feat)
+
+        # Store for compute_loss — only needed during training
+        if self.training:
+            self._last_feat = feat  # [N, hidden_channels]
+
+        # 6. Prediction
+        logits = self.score_head(feat)
+        learned_scores = torch.sigmoid(logits)
+        
+        # Avoid 0/1 collapse for loss stability
+        learned_scores = torch.clamp(learned_scores, min=1e-5, max=1 - 1e-5)
+        
+        return learned_scores
+
+    def compute_loss(self, scores, coords, batch_ids, offset, z_target=None):
+        # Retrieve stored features — None if not training (global loss skipped automatically)
+        features = getattr(self, '_last_feat', None)
+        return self.ordering_loss(
+            scores, coords, batch_ids, offset, z_target=z_target, features=features)
+
+
+# ---------------------------------------------------------------------------
+# OPTNet
+# ---------------------------------------------------------------------------
 
 @MODELS.register_module("OPTNet")
 class OPTNet(PointTransformerV3):
-    def __init__(self,
-                 in_channels=6,
-                 order=("z", "z-trans", "hilbert", "hilbert-trans"),
-                 ordering_loss_weight=1.0,
-                 ordering_k=16,
-                 warmup_epoch=0,
-                 contrastive_k_far=32,
-                 contrastive_k_near=None,
-                 contrastive_temp=0.5,
-                 contrastive_weight=0.5,
-                 enable_score_concat=True, 
-                 z_loss_weight=10.0, # Strong supervision for Z-order
-                 **kwargs):
-        
-        if isinstance(order, (list, tuple)):
-            single_order = [order[0]]
-        else:
-            single_order = [order]
-            
+    def __init__(
+        self,
+        in_channels=6,
+        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+        ordering_loss_weight=1.0,
+        ordering_k=16,
+        warmup_epoch=5,
+        enable_score_concat=True,
+        tau=0.1,
+        loss_weights=[0,0,0,1], # Only global feature loss for now
+        num_classes=13,
+        code_depth=10,
+        pool_sizes = [4, 8, 8, 16], # For the 3 pooling layers in PTv3
+        **kwargs,
+    ):
+        single_order = [order[0]] if isinstance(order, (list, tuple)) else [order]
         self.enable_score_concat = enable_score_concat
-        
-        # [FEATURE CONCATENATION]: 
-        backbone_in_channels = in_channels + 1 if enable_score_concat else in_channels
-            
-        super().__init__(in_channels=backbone_in_channels, order=single_order, **kwargs)
-        
-        self.ordering_loss_weight = ordering_loss_weight
-        self.warmup_epoch = warmup_epoch
-        
-        if contrastive_k_near is None:
-            contrastive_k_near = ordering_k
+        self.code_depth          = code_depth
 
-        self.sorter = PointSorter(
-            in_channels=in_channels + 3,
-            hidden_channels=64,
-            num_orders=1,
-            ordering_k=ordering_k,
-            contrastive_k_near=contrastive_k_near,
-            contrastive_k_far=contrastive_k_far,
-            temp_contrastive=contrastive_temp,
-            z_loss_weight=z_loss_weight
+        backbone_in_channels = in_channels + 1 if enable_score_concat else in_channels
+        super().__init__(
+            in_channels=backbone_in_channels,
+            order=single_order,
+            **kwargs
         )
 
+        self.ordering_loss_weight = ordering_loss_weight
+        self.warmup_epoch         = warmup_epoch
+        self.all_orders           = list(order) if isinstance(order, (list, tuple)) else [order]
+        # e.g. ["z", "z-trans", "hilbert", "hilbert-trans"]
+
+
+        # in_channels == point.feat channels == len(feat_keys) * 3 == 6
+        self.sorter = PointSorter(
+            in_channels=in_channels,
+            hidden_channels=64,
+            ordering_k=ordering_k,
+            num_classes=num_classes,
+            loss_weights=loss_weights,
+            tau=tau
+        )
+        self.code_depth = code_depth
+        self._replace_pooling_layers(pool_sizes=pool_sizes)
+
+    # def _replace_pooling_layers(self, pool_sizes=None):
+    #     # Recursively find and replace SerializedPooling with GridPoolingLayer
+    #     for name, module in self.named_modules():
+    #         # Check if it's a PointSequential or similar container that holds layers
+    #         if hasattr(module, "__iter__"): 
+    #             continue # Skip, we need to modify the parent
+            
+    #     # Safer approach: Iterate the encoder specific structure
+    #     # PTv3 stores stages in self.enc (a PointSequential)
+    #     for i, stage in enumerate(self.enc):
+    #         if isinstance(stage, SerializedPooling):
+    #             # Retrieve config from the existing layer
+    #             in_c = stage.in_channels
+    #             out_c = stage.out_channels
+    #             stride = stage.stride
+                
+    #             # Create replacement
+    #             grid_pool = GridPoolingLayer(
+    #                 in_channels=in_c,
+    #                 out_channels=out_c,
+    #                 stride=stride,
+    #                 code_depth=self.code_depth,
+    #                 traceable=True
+    #             )
+                
+    #             # Replace in the sequential container
+    #             self.enc[i] = grid_pool
+
+    def _replace_pooling_layers(self, pool_sizes=[8, 8, 8]):
+        for i, layer in enumerate(self.enc):
+            if isinstance(layer, SerializedPooling):
+                self.enc[i] = SortedWindowPooling(
+                    in_channels=layer.in_channels,
+                    out_channels=layer.out_channels,
+                    pool_size=pool_sizes[i] if i < len(pool_sizes) else 8,
+                    code_depth=self.code_depth,
+                    traceable=True,
+                )
+
+    def _build_serialization_from_scores(self, scores, point):
+        code    = scores_to_hierarchical_code(scores, point.batch,
+                                              depth=self.code_depth)
+        code_2d = code.unsqueeze(0)
+
+        order   = torch.argsort(code_2d, dim=1)
+        inverse = torch.zeros_like(order).scatter_(
+            dim=1,
+            index=order,
+            src=torch.arange(
+                order.shape[1], device=order.device
+            ).unsqueeze(0).expand_as(order),
+        )
+
+        point.serialized_code    = code_2d
+        point.serialized_order   = order
+        point.serialized_inverse = inverse
+        point.serialized_depth   = self.code_depth
+
     def forward(self, data_dict):
-        point = Point(data_dict)
-        current_epoch = data_dict.get("epoch", 0) if self.training else float('inf')
-        need_standard_z = current_epoch < self.warmup_epoch
+        point         = Point(data_dict)
+        
+        current_epoch = data_dict.get("epoch", 0) if self.training else float("inf")
+        use_learned   = current_epoch >= self.warmup_epoch
 
-        point.serialization(compute_codes=False) 
-
-        # 2. Run OPTNet Sorter
-        # NOTE: We do NOT pass Z-score as input. Network must learn it.
-        learned_scores, learned_order, learned_inverse = self.sorter(point)
-
-        # 3. Apply Order Strategy
-        if not need_standard_z:
-            point.serialized_order = learned_order
-            point.serialized_inverse = learned_inverse
-            primary_inverse = learned_inverse[0] 
-            point.serialized_code = primary_inverse.unsqueeze(0).long() 
+        # ------------------------------------------------------------------
+        # 1. Z-order serialization — training only
+        #    Used for warmup backbone ordering + Z-regression loss target
+        # ------------------------------------------------------------------
+        if self.training:
+            # 1. Create a lightweight temporary point just for multi-order targets
+            # (Zero memory overhead because we omit the heavy .feat tensor)
+            tmp_point = Point({
+                "grid_coord": point.grid_coord,
+                "batch": point.batch
+            })
             
-        # 4. Calculate Loss
-        # We pass z_score_target here so the loss can force learned_scores to approximate it
+            tmp_point.serialization(
+                order=self.all_orders,   # Pass all K orders here
+                shuffle_orders=False,    # Targets don't need shuffling
+                compute_codes=True,
+            )
+            # Save the [4, N] target codes
+            target_codes = tmp_point.serialized_code.float().clone()
+
+            # 2. Run the normal single-order serialization for the actual backbone
+            if not use_learned:
+                point.serialization(
+                    order=self.order,        # Uses your single self.order
+                    shuffle_orders=True,   # Shuffle only before warmup
+                    compute_codes=True,
+                )
+        else:
+            target_codes = None
+
+
+        # ------------------------------------------------------------------
+        # 2. Run PointSorter  (uses point.feat directly — 6 channels)
+        # ------------------------------------------------------------------
+        learned_scores = self.sorter(point)
+        point.scores = learned_scores  # Store scores for potential use in pooling layers
+
+        # ------------------------------------------------------------------
+        # 3. Build serialization from learned scores
+        #    Post-warmup training: override Z-order codes
+        #    Inference: always use learned codes (no Z computed above)
+        # ------------------------------------------------------------------
+        if use_learned:
+            self._build_serialization_from_scores(learned_scores, point)
+
+        # ------------------------------------------------------------------
+        # 4. Compute ordering loss (training only)
+        # ------------------------------------------------------------------
         if self.training and self.ordering_loss_weight > 0:
-
-            # 1. Compute Standard Z-Order (Used for training target)
-            point.serialization(order=self.order, 
-                                shuffle_orders=self.shuffle_orders, 
-                                compute_codes=True) 
-            
-            # Extract Z-Score as Training Target
-            z_code = point.serialized_code.float()
-            z_score_target = (z_code - z_code.min()) / (z_code.max() - z_code.min() + 1e-6)
+            # target_codes is already [4, N]
+            code_mins = target_codes.min(dim=1, keepdim=True)[0]
+            code_maxs = target_codes.max(dim=1, keepdim=True)[0]
+            z_targets = (target_codes - code_mins) / (code_maxs - code_mins + 1e-6)
 
             loss_ord, loss_dict = self.sorter.compute_loss(
-                learned_scores, 
-                point.coord, 
-                point.batch, 
+                learned_scores,
+                point.coord,
+                point.batch,
                 point.offset,
-                z_target=z_score_target # Supervise with Z-order
+                z_target=z_targets, # Passes shape [4, N] natively
             )
-            # Relax clip slightly to allow learning trend
-            loss_ord = torch.clamp(loss_ord, max=10.0) 
+
+            
+            loss_ord            = torch.clamp(loss_ord, max=10.0)
             point.ordering_loss = loss_ord * self.ordering_loss_weight
 
-        # [FEATURE CONCATENATION]
+        # ------------------------------------------------------------------
+        # 5. Concatenate scores into backbone features
+        # ------------------------------------------------------------------
         if self.enable_score_concat:
             if point.feat is None:
                 point.feat = learned_scores
             else:
                 point.feat = torch.cat([point.feat, learned_scores], dim=1)
-        
-        # 5. Late Sparsify
-        point.sparsify() 
- 
-        # 6. Backbone Forward
-        point = self.embedding(point) 
+
+        # ------------------------------------------------------------------
+        # 6. Sparsify → PTv3 backbone
+        # ------------------------------------------------------------------
+        point.sparsify()
+        point = self.embedding(point)
         point = self.enc(point)
         if not self.enc_mode:
             point = self.dec(point)
-        
         return point
+
+
+# ---------------------------------------------------------------------------
+# OPTNetSegmentor
+# ---------------------------------------------------------------------------
 
 @MODELS.register_module("OPTNetSegmentor")
 class OPTNetSegmentor(nn.Module):
     def __init__(self, backbone, criteria, num_classes, backbone_out_channels=None):
         super().__init__()
-        self.backbone = MODELS.build(backbone)
-        self.criteria = build_criteria(criteria)
-        self.seg_head = nn.Linear(backbone_out_channels, num_classes)
+        self.backbone    = MODELS.build(backbone)
+        self.criteria    = build_criteria(criteria)
+        self.seg_head    = nn.Linear(backbone_out_channels, num_classes)
         self.num_classes = num_classes
 
     def forward(self, data_dict):
-        point = self.backbone(data_dict)
+        point      = self.backbone(data_dict)
         seg_logits = self.seg_head(point.feat)
-        
+
         if self.training:
             target = data_dict["segment"]
-            
-            if not target.dtype == torch.int64:
+            if target.dtype != torch.int64:
                 target = target.long()
 
             valid_mask = (target >= 0) & (target < self.num_classes)
@@ -353,18 +816,20 @@ class OPTNetSegmentor(nn.Module):
                 target = target.clone()
                 target[~valid_mask] = -1
 
-            loss = self.criteria(seg_logits, target)
-            return_dict = dict(seg_loss=loss)
-            
+            seg_loss    = self.criteria(seg_logits, target)
+            return_dict = dict(seg_loss=seg_loss)
+
             if "ordering_loss" in point:
-                loss = loss + point["ordering_loss"]
-                return_dict["ordering_loss"] = point["ordering_loss"]
-            
-            return_dict["loss"] = loss
+                ordering_loss                = point["ordering_loss"]
+                return_dict["ordering_loss"] = ordering_loss
+                return_dict["loss"]          = seg_loss + ordering_loss
+            else:
+                return_dict["loss"] = seg_loss
+
             return return_dict
-        
+
         elif "segment" in data_dict:
             loss = self.criteria(seg_logits, data_dict["segment"])
             return dict(loss=loss, seg_logits=seg_logits)
-        
+
         return dict(seg_logits=seg_logits)
