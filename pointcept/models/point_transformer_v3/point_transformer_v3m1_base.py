@@ -537,7 +537,6 @@ class PointTransformerV3(PointModule):
         proj_drop=0.0,
         drop_path=0.3,
         pre_norm=True,
-        shuffle_orders=True,
         enable_rpe=False,
         enable_flash=True,
         upcast_attention=False,
@@ -554,7 +553,6 @@ class PointTransformerV3(PointModule):
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.enc_mode = enc_mode
-        self.shuffle_orders = shuffle_orders
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
