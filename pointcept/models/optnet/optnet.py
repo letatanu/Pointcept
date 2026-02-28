@@ -14,91 +14,288 @@ import torch.nn.functional as F
 from pointcept.models.utils.structure import Point
 from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import SerializedPooling
 
+# class SortedWindowPooling(nn.Module):
+#     """
+#     O(N) pooling directly on the 1D sorted order from PointSorter.
+    
+#     Valid because _locality_loss enforces:  score_neighbors ≈ score_i
+#     → consecutive points in sorted order ARE 3D spatial neighbors.
+    
+#     Every `pool_size` consecutive sorted points → 1 super-point.
+#     No grid hashing, no scatter, no kNN — just reshape + mean.
+#     """
+#     def __init__(
+#         self,
+#         in_channels,
+#         out_channels,
+#         pool_size=8,        # 8 ≈ stride=2 in PTv3 octree (2^3 = 8 cells merged)
+#         code_depth=10,
+#         traceable=True,
+#         norm_layer=nn.LayerNorm,
+#         act_layer=nn.GELU,
+#     ):
+#         super().__init__()
+#         self.pool_size = pool_size
+#         self.code_depth = code_depth
+#         self.traceable = traceable
+#         self.proj = nn.Linear(in_channels, out_channels, bias=False)
+#         self.norm = norm_layer(out_channels)
+#         self.act = act_layer()
+
+#     def forward(self, point: Point):
+#         order = point.serialized_order[0]   # [N]: sorted_pos → orig_idx
+#         P = self.pool_size
+#         device = order.device
+
+#         # ------------------------------------------------------------------
+#         # 1. Batch-safe clipping
+#         # Batch index lives in high bits of serialized_code, so sorted order
+#         # naturally groups per-batch. We clip each batch's tail to a multiple
+#         # of P to avoid cross-batch window pollution.
+#         # ------------------------------------------------------------------
+#         sorted_batch = point.batch[order]
+#         _, counts = torch.unique_consecutive(sorted_batch, return_counts=True)
+#         per_batch_valid = (counts // P) * P        # floor to multiple of P
+#         valid_ends = torch.cumsum(per_batch_valid, dim=0)
+#         valid_starts = torch.cat([
+#             torch.zeros(1, dtype=torch.long, device=device), valid_ends[:-1]
+#         ])
+
+#         valid_orig_idx = torch.cat([
+#             order[valid_starts[b]:valid_ends[b]]
+#             for b in range(len(counts))
+#             if valid_ends[b] > valid_starts[b]
+#         ], dim=0)                                   # [N_valid]
+
+#         N_valid = valid_orig_idx.shape[0]
+#         n_groups = N_valid // P
+
+#         # ------------------------------------------------------------------
+#         # 2. Pool features: sort → reshape → mean  (the key O(N) operation)
+#         # ------------------------------------------------------------------
+#         sorted_feat = point.feat[valid_orig_idx]                    # [N_valid, C_in]
+#         pooled_feat = sorted_feat.view(n_groups, P, -1).mean(dim=1) # [n_groups, C_in]
+
+#         # ------------------------------------------------------------------
+#         # 3. Representative point per group (center of window)
+#         # ------------------------------------------------------------------
+#         center_pos = torch.arange(n_groups, device=device) * P + (P // 2)
+#         center_orig_idx = valid_orig_idx[center_pos]               # [n_groups]
+
+#         # ------------------------------------------------------------------
+#         # 4. Build new Point
+#         # ------------------------------------------------------------------
+#         new_point = Point()
+#         new_point.coord      = point.coord[center_orig_idx]
+#         new_point.grid_coord = torch.div(
+#             point.grid_coord[center_orig_idx], P, rounding_mode='floor'
+#         )
+#         new_point.batch  = point.batch[center_orig_idx]
+#         new_point.offset = pointops.compute_offset(new_point.batch)
+#         new_point.feat   = self.act(self.norm(self.proj(pooled_feat)))
+
+#         # ------------------------------------------------------------------
+#         # 5. Pool scores → re-serialize for next Transformer block
+#         # ------------------------------------------------------------------
+#         sorted_scores  = point.scores[valid_orig_idx]                    # [N_valid, 1]
+#         pooled_scores  = sorted_scores.view(n_groups, P, -1).mean(dim=1) # [n_groups, 1]
+#         new_point.scores = pooled_scores
+
+#         code       = scores_to_hierarchical_code(pooled_scores, new_point.batch, depth=self.code_depth)
+#         code_2d    = code.unsqueeze(0)
+#         new_order  = torch.argsort(code_2d, dim=1)
+#         new_inverse = torch.zeros_like(new_order).scatter_(
+#             1, new_order,
+#             torch.arange(new_order.shape[1], device=device).unsqueeze(0).expand_as(new_order)
+#         )
+#         new_point.serialized_code    = code_2d
+#         new_point.serialized_order   = new_order
+#         new_point.serialized_inverse = new_inverse
+#         new_point.serialized_depth   = self.code_depth
+
+#         # ------------------------------------------------------------------
+#         # 6. Traceability for decoder unpooling
+#         # ------------------------------------------------------------------
+#         if self.traceable:
+#             group_ids        = torch.arange(n_groups, device=device).repeat_interleave(P)
+#             pooling_inverse  = torch.full((order.shape[0],), n_groups - 1,
+#                                           dtype=torch.long, device=device)
+#             pooling_inverse[valid_orig_idx] = group_ids
+#             new_point.pooling_inverse = pooling_inverse
+#             new_point.pooling_parent  = point
+
+#         return new_point
+
+class OffsetSorter(nn.Module):
+    def __init__(self, in_channels=6, hidden_channels=64):
+        super().__init__()
+        # Tiny, fast MLP. No Fourier features required.
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.BatchNorm1d(hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, 1),
+            nn.Tanh() # Bounds the output to [-1, 1]
+        )
+        # Scale factor limits how far a point can jump in the sorted list
+        self.offset_scale = 0.05 
+
+    def forward(self, point):
+        # 1. Get the perfect deterministic spatial code already calculated by PTv3
+        z_code = point.serialized_code[0].float()
+        
+        # Normalize the base score to [0, 1]
+        base_score = (z_code - z_code.min()) / (z_code.max() - z_code.min() + 1e-6)
+        
+        # 2. Predict the semantic offset using Coord(3) + Color(3)
+        inp = point.feat if point.feat is not None else point.coord
+        offset = self.mlp(inp).squeeze(-1)
+        
+        # 3. Final Score = Spatial Base + Semantic Nudge
+        final_scores = base_score + (offset * self.offset_scale)
+        
+        # Clamp to avoid extreme outliers
+        return torch.clamp(final_scores, min=1e-5, max=1 - 1e-5).unsqueeze(1)
+
+# class PointSorter(nn.Module):
+#     """
+#     Lightweight Sorter that uses PTv3's perfect spatial Z-code as a base,
+#     and applies a learned semantic offset via a simple MLP.
+#     """
+#     def __init__(self, in_channels=6, hidden_channels=64, ordering_k=16, loss_weights=[1, 0, 0, 1], tau=0.1, num_classes=13):
+#         super().__init__()
+#         self.num_classes = num_classes
+        
+#         # Tiny, fast MLP. No Fourier features or ResNet blocks required.
+#         self.mlp = nn.Sequential(
+#             nn.Linear(in_channels, hidden_channels),
+#             nn.BatchNorm1d(hidden_channels),
+#             nn.ReLU(),
+#             nn.Linear(hidden_channels, 1),
+#             nn.Tanh() # Bounds the output to [-1, 1]
+#         )
+        
+#         # Scale factor limits how far a point can jump in the sorted list
+#         self.offset_scale = 0.05 
+        
+#         # NOTE: Make sure your loss_weights has a value > 0 for the first element (locality)
+#         self.ordering_loss = OrderingLoss(ordering_k=ordering_k, loss_weights=loss_weights, tau=tau, ignore_index=-1)
+
+#     def forward(self, point):
+#         # 1. Get the perfect deterministic spatial code calculated by PTv3
+#         z_code = point.serialized_code[0].float()
+        
+#         # Normalize the base score to [0, 1]
+#         base_score = (z_code - z_code.min()) / (z_code.max() - z_code.min() + 1e-6)
+        
+#         # 2. Predict the semantic offset using Coord(3) + Color(3)
+#         inp = point.feat if point.feat is not None else point.coord
+#         offset = self.mlp(inp).squeeze(-1)
+        
+#         # 3. Final Score = Spatial Base + Semantic Nudge
+#         final_scores = base_score + (offset * self.offset_scale)
+        
+#         # Clamp to avoid extreme outliers
+#         learned_scores = torch.clamp(final_scores, min=1e-5, max=1 - 1e-5).unsqueeze(1)
+        
+#         # Store for loss computation
+#         if self.training:
+#             self._last_feat = self.mlp[0:3](inp) # Save hidden features for global loss
+            
+#         return learned_scores
+
+#     def compute_loss(self, scores, coords, batch_ids, offset, z_target=None, labels=None):
+#         features = getattr(self, '_last_feat', None)
+#         return self.ordering_loss(
+#             scores, coords, batch_ids, offset, 
+#             z_target=z_target, 
+#             features=features,
+#             labels=labels # IMPORTANT: Pass labels down to OrderingLoss
+#         )
+
 class SortedWindowPooling(nn.Module):
-    """
-    O(N) pooling directly on the 1D sorted order from PointSorter.
-    
-    Valid because _locality_loss enforces:  score_neighbors ≈ score_i
-    → consecutive points in sorted order ARE 3D spatial neighbors.
-    
-    Every `pool_size` consecutive sorted points → 1 super-point.
-    No grid hashing, no scatter, no kNN — just reshape + mean.
-    """
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        pool_size=8,        # 8 ≈ stride=2 in PTv3 octree (2^3 = 8 cells merged)
-        code_depth=10,
-        traceable=True,
-        norm_layer=nn.LayerNorm,
-        act_layer=nn.GELU,
-    ):
+    def __init__(self, in_channels, out_channels, 
+            pool_size=8, stride=2, 
+            code_depth=10, traceable=True, 
+            norm_layer=nn.LayerNorm, 
+            act_layer=nn.GELU, **kwargs):
         super().__init__()
         self.pool_size = pool_size
+        self.stride = stride  # Fix: explicitly define the spatial stride
         self.code_depth = code_depth
         self.traceable = traceable
+
+        # Added for Centroid-Aware Voxelization: MLP for offset encoding
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(3, in_channels, bias=False),
+            norm_layer(in_channels),
+            act_layer(),
+            nn.Linear(in_channels, in_channels, bias=False)
+        )
+        
         self.proj = nn.Linear(in_channels, out_channels, bias=False)
         self.norm = norm_layer(out_channels)
         self.act = act_layer()
 
     def forward(self, point: Point):
-        order = point.serialized_order[0]   # [N]: sorted_pos → orig_idx
+        order = point.serialized_order[0]
         P = self.pool_size
         device = order.device
 
-        # ------------------------------------------------------------------
         # 1. Batch-safe clipping
-        # Batch index lives in high bits of serialized_code, so sorted order
-        # naturally groups per-batch. We clip each batch's tail to a multiple
-        # of P to avoid cross-batch window pollution.
-        # ------------------------------------------------------------------
         sorted_batch = point.batch[order]
         _, counts = torch.unique_consecutive(sorted_batch, return_counts=True)
-        per_batch_valid = (counts // P) * P        # floor to multiple of P
+        per_batch_valid = (counts // P) * P
         valid_ends = torch.cumsum(per_batch_valid, dim=0)
-        valid_starts = torch.cat([
-            torch.zeros(1, dtype=torch.long, device=device), valid_ends[:-1]
-        ])
+        valid_starts = torch.cat([torch.zeros(1, dtype=torch.long, device=device), valid_ends[:-1]])
 
         valid_orig_idx = torch.cat([
             order[valid_starts[b]:valid_ends[b]]
-            for b in range(len(counts))
-            if valid_ends[b] > valid_starts[b]
-        ], dim=0)                                   # [N_valid]
+            for b in range(len(counts)) if valid_ends[b] > valid_starts[b]
+        ], dim=0)
 
         N_valid = valid_orig_idx.shape[0]
         n_groups = N_valid // P
 
         # ------------------------------------------------------------------
-        # 2. Pool features: sort → reshape → mean  (the key O(N) operation)
+        # 2. Centroid-Aware Voxelization 
         # ------------------------------------------------------------------
-        sorted_feat = point.feat[valid_orig_idx]                    # [N_valid, C_in]
-        pooled_feat = sorted_feat.view(n_groups, P, -1).mean(dim=1) # [n_groups, C_in]
+        sorted_coord = point.coord[valid_orig_idx].view(n_groups, P, 3)     
+        sorted_feat = point.feat[valid_orig_idx].view(n_groups, P, -1)      
+
+        # Calculate true physical centroid 
+        centroid = sorted_coord.mean(dim=1)                                 
+        
+        # Calculate local spatial offset and encode to positional features
+        offset = sorted_coord - centroid.unsqueeze(1)                       
+        pos_enc = self.pos_mlp(offset)                                      
+        
+        # Inject positional encoding to point features before pooling
+        encoded_feat = sorted_feat + pos_enc                                
+        pooled_feat = encoded_feat.mean(dim=1)                              
 
         # ------------------------------------------------------------------
-        # 3. Representative point per group (center of window)
+        # 3. Build new Point
         # ------------------------------------------------------------------
         center_pos = torch.arange(n_groups, device=device) * P + (P // 2)
-        center_orig_idx = valid_orig_idx[center_pos]               # [n_groups]
+        center_orig_idx = valid_orig_idx[center_pos]
 
-        # ------------------------------------------------------------------
-        # 4. Build new Point
-        # ------------------------------------------------------------------
         new_point = Point()
-        new_point.coord      = point.coord[center_orig_idx]
+        new_point.coord = centroid # Use computed centroid as coordinate
+        
+        # BUG FIX: Divide grid_coord by `stride` (e.g., 2), NOT `pool_size`
         new_point.grid_coord = torch.div(
-            point.grid_coord[center_orig_idx], P, rounding_mode='floor'
+            point.grid_coord[center_orig_idx], self.stride, rounding_mode='floor'
         )
         new_point.batch  = point.batch[center_orig_idx]
         new_point.offset = pointops.compute_offset(new_point.batch)
         new_point.feat   = self.act(self.norm(self.proj(pooled_feat)))
 
         # ------------------------------------------------------------------
-        # 5. Pool scores → re-serialize for next Transformer block
+        # 4. Pool scores & serialization logic
         # ------------------------------------------------------------------
-        sorted_scores  = point.scores[valid_orig_idx]                    # [N_valid, 1]
-        pooled_scores  = sorted_scores.view(n_groups, P, -1).mean(dim=1) # [n_groups, 1]
+        sorted_scores  = point.scores[valid_orig_idx]
+        pooled_scores  = sorted_scores.view(n_groups, P, -1).mean(dim=1)
         new_point.scores = pooled_scores
 
         code       = scores_to_hierarchical_code(pooled_scores, new_point.batch, depth=self.code_depth)
@@ -108,23 +305,21 @@ class SortedWindowPooling(nn.Module):
             1, new_order,
             torch.arange(new_order.shape[1], device=device).unsqueeze(0).expand_as(new_order)
         )
+        
         new_point.serialized_code    = code_2d
         new_point.serialized_order   = new_order
         new_point.serialized_inverse = new_inverse
         new_point.serialized_depth   = self.code_depth
 
-        # ------------------------------------------------------------------
-        # 6. Traceability for decoder unpooling
-        # ------------------------------------------------------------------
         if self.traceable:
             group_ids        = torch.arange(n_groups, device=device).repeat_interleave(P)
-            pooling_inverse  = torch.full((order.shape[0],), n_groups - 1,
-                                          dtype=torch.long, device=device)
+            pooling_inverse  = torch.full((order.shape[0],), n_groups - 1, dtype=torch.long, device=device)
             pooling_inverse[valid_orig_idx] = group_ids
             new_point.pooling_inverse = pooling_inverse
             new_point.pooling_parent  = point
 
         return new_point
+
 
 class GridPoolingLayer(nn.Module):
     def __init__(self, in_channels, out_channels, stride=2, code_depth=10,
@@ -200,14 +395,16 @@ def scores_to_hierarchical_code(scores, batch, depth=10):
 # ---------------------------------------------------------------------------
 
 class OrderingLoss(nn.Module):
-    def __init__(self, ordering_k=16, loss_weights=[0,0,0,1], tau=0.1):
+    def __init__(self, ordering_k=16, loss_weights=[0,0,0,1], tau=0.1, ignore_index=-1):
         super().__init__()
         self.ordering_k = ordering_k
         # Unpack the list: [locality, distribution, z_regression, global_feature]
         self.w_loc, self.w_dist, self.w_z, self.w_glob = loss_weights
         self.tau = tau
+        self.ignore_index = ignore_index 
 
-    def forward(self, scores, coords, batch_ids, offset, z_target=None, features=None):
+
+    def forward(self, scores, coords, batch_ids, offset, z_target=None, features=None, labels=None):
         scores_1d = scores.view(-1, 1)
         total = torch.tensor(0.0, device=scores.device)
         loss_dict = {}
@@ -219,16 +416,24 @@ class OrderingLoss(nn.Module):
                 offset = torch.cumsum(counts, dim=0).int()
             else:
                 offset = offset.int()
-
-            loss_locality = self._locality_loss(scores_1d, coords, offset) * self.w_loc
+            if labels is not None:
+                loss_locality = self.semantic_locality_loss(scores_1d, coords, labels, offset) * self.w_loc
+            else:
+                loss_locality = self._locality_loss(scores_1d, coords, offset) * self.w_loc
             total = total + loss_locality
             loss_dict["locality"] = loss_locality.item()
 
         # 2. Distribution Loss
         if self.w_dist > 0:
-            loss_distribution = self._distribution_loss(scores_1d, batch_ids) * self.w_dist
+            if offset is None:
+                _, counts = torch.unique_consecutive(batch_ids.long(), return_counts=True)
+                offset = torch.cumsum(counts, dim=0).int()
+            else:
+                offset = offset.int()
+            loss_distribution = self._fps_distribution_loss(scores_1d, coords, batch_ids, offset) * self.w_dist
             total = total + loss_distribution
             loss_dict["distribution"] = loss_distribution.item()
+
 
         # 3. Z-Regression Loss
         if z_target is not None and self.w_z > 0:
@@ -264,21 +469,62 @@ class OrderingLoss(nn.Module):
         neighbor_scores = scores[idx]
         return F.mse_loss(scores.unsqueeze(1).expand_as(neighbor_scores), neighbor_scores)
 
-    def _distribution_loss(self, scores, batch_ids):
+    def _fps_distribution_loss(self, scores, coords, batch_ids, offset, num_centroids=128):
+        """
+        Uses Farthest Point Sampling to find geometrically distant anchor points,
+        then forces their scores to be uniformly distributed across [0, 1].
+        """
         batch_ids_long = batch_ids.long()
         num_batches = int(batch_ids_long.max().item()) + 1
-        total = torch.tensor(0.0, device=scores.device)
+        total_dist_loss = torch.tensor(0.0, device=scores.device)
         count = 0
+        
+        # In Pointcept, offset is the cumulative sum of points per batch.
+        # If it's None, we calculate it.
+        if offset is None:
+            _, counts = torch.unique_consecutive(batch_ids_long, return_counts=True)
+            offset = torch.cumsum(counts, dim=0).int()
+        else:
+            offset = offset.int()
+
+        # The Pointcept FPS function requires a target offset array to know
+        # how many points to sample per batch.
+        # We want `num_centroids` points per batch, so we create a new offset array:
+        # [128, 256, 384, ...]
+        new_counts = torch.full((num_batches,), num_centroids, dtype=torch.int32, device=scores.device)
+        new_offset = torch.cumsum(new_counts, dim=0).int()
+
+        # We can only perform FPS if EVERY batch has at least `num_centroids` points.
+        # Otherwise, the CUDA kernel will crash.
+        min_points_in_batch = offset[0] if num_batches == 1 else min(offset[0], (offset[1:] - offset[:-1]).min())
+        if min_points_in_batch < num_centroids:
+            # If a room has too few points, we skip the distribution loss for this step
+            # to avoid crashing the FPS CUDA kernel.
+            return torch.tensor(0.0, device=scores.device)
+
+        # 1. Run Farthest Point Sampling using Pointcept's 1D flattened format
+        # Returns the indices of the sampled points in the flattened array
+        fps_idx = pointops.farthest_point_sampling(coords.contiguous(), offset, new_offset).long()
+        
+        # 2. Compute loss per batch
         for b in range(num_batches):
-            mask = (batch_ids_long == b)
-            if mask.sum() < 2:
-                continue
-            scores_b = scores[mask].flatten()
-            sorted_scores, _ = torch.sort(scores_b)
-            target = torch.linspace(0, 1, scores_b.shape[0], device=scores.device)
-            total = total + F.l1_loss(sorted_scores, target)
+            # Extract the FPS indices for this specific batch
+            start_idx = b * num_centroids
+            end_idx = (b + 1) * num_centroids
+            b_fps_idx = fps_idx[start_idx:end_idx]
+            
+            # Extract the predicted scores for these distant anchors
+            anchor_scores = scores[b_fps_idx].flatten()
+            
+            # 3. Force these distant points to stretch across the [0, 1] spectrum
+            sorted_anchors, _ = torch.sort(anchor_scores)
+            target = torch.linspace(0, 1, steps=num_centroids, device=scores.device)
+            
+            total_dist_loss = total_dist_loss + F.l1_loss(sorted_anchors, target)
             count += 1
-        return total / max(count, 1)
+            
+        return total_dist_loss / max(count, 1)
+
 
     def _global_feature_loss(self, scores, features, batch_ids):
         """
@@ -312,7 +558,37 @@ class OrderingLoss(nn.Module):
         # 5. The loss is the MSE between the Sorter's predicted scores and the target feature difference
         return F.mse_loss(scores, target_scores.detach())
 
-
+    def semantic_locality_loss(self, scores, coords, labels, offset):
+        N = scores.shape[0]
+        if N < 2 or torch.isnan(coords).any():
+            return torch.tensor(0.0, device=scores.device)
+            
+        k = min(self.ordering_k, N - 1)
+        
+        # 1. Find K-nearest spatial neighbors
+        idx = pointops.knn_query(k, coords.contiguous(), offset)[0].long()
+        idx = torch.clamp(idx, 0, N - 1)
+        
+        neighbor_scores = scores[idx] # [N, K, 1]
+        neighbor_labels = labels[idx] # [N, K]
+        
+        curr_scores = scores.unsqueeze(1).expand_as(neighbor_scores)
+        curr_labels = labels.unsqueeze(1).expand_as(neighbor_labels)
+        
+        # 2. Create masks for same class vs different class
+        valid_mask = (curr_labels != self.ignore_index) & (neighbor_labels != self.ignore_index)
+        same_class = (curr_labels == neighbor_labels) & valid_mask
+        diff_class = (curr_labels != neighbor_labels) & valid_mask
+        
+        # 3. PULL: Spatially close points of the SAME class should have identical 1D scores
+        pull_loss = F.mse_loss(curr_scores[same_class], neighbor_scores[same_class]) if same_class.any() else 0.0
+        
+        # 4. PUSH: Spatially close points of DIFFERENT classes should be separated in the 1D sequence
+        margin = 0.02 # A small margin creates a local sequence boundary without breaking global spatial Z-order
+        score_diff = torch.abs(curr_scores[diff_class] - neighbor_scores[diff_class])
+        push_loss = F.relu(margin - score_diff).mean() if diff_class.any() else 0.0
+        
+        return pull_loss + push_loss
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +774,7 @@ class PointSorter(nn.Module):
         tau=0.1,
         num_classes=13,
         num_freqs=10,       # 10 freqs cover grid resolution ~1024 (2^10)
+        ignore_index=-1,    # For semantic locality loss, if using labels
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -534,7 +811,7 @@ class PointSorter(nn.Module):
         self.ordering_loss = OrderingLoss(
             ordering_k=ordering_k,
             loss_weights=loss_weights,
-            tau=tau
+            tau=tau, ignore_index=ignore_index
         )
 
         # We skip the heavy solver init now, standard initialization works 
@@ -582,11 +859,11 @@ class PointSorter(nn.Module):
         
         return learned_scores
 
-    def compute_loss(self, scores, coords, batch_ids, offset, z_target=None):
+    def compute_loss(self, scores, coords, batch_ids, offset, z_target=None, labels=None):
         # Retrieve stored features — None if not training (global loss skipped automatically)
         features = getattr(self, '_last_feat', None)
         return self.ordering_loss(
-            scores, coords, batch_ids, offset, z_target=z_target, features=features)
+            scores, coords, batch_ids, offset, z_target=z_target, features=features, labels=labels)
 
 
 # ---------------------------------------------------------------------------
@@ -608,11 +885,13 @@ class OPTNet(PointTransformerV3):
         num_classes=13,
         code_depth=10,
         pool_sizes = [4, 8, 8, 16], # For the 3 pooling layers in PTv3
+        use_labels_in_loss=False, # Whether to fuse GT segment labels into the Sorter loss
         **kwargs,
     ):
         single_order = [order[0]] if isinstance(order, (list, tuple)) else [order]
         self.enable_score_concat = enable_score_concat
         self.code_depth          = code_depth
+        self.use_labels_in_loss   = use_labels_in_loss
 
         backbone_in_channels = in_channels + 1 if enable_score_concat else in_channels
         super().__init__(
@@ -634,10 +913,11 @@ class OPTNet(PointTransformerV3):
             ordering_k=ordering_k,
             num_classes=num_classes,
             loss_weights=loss_weights,
-            tau=tau
+            tau=tau, 
+            ignore_index=kwargs.get("ignore_index", -1)
         )
         self.code_depth = code_depth
-        self._replace_pooling_layers(pool_sizes=pool_sizes)
+        self._replace_pooling_layers(stride=kwargs['stride'], pool_sizes=pool_sizes)
 
     # def _replace_pooling_layers(self, pool_sizes=None):
     #     # Recursively find and replace SerializedPooling with GridPoolingLayer
@@ -667,13 +947,14 @@ class OPTNet(PointTransformerV3):
     #             # Replace in the sequential container
     #             self.enc[i] = grid_pool
 
-    def _replace_pooling_layers(self, pool_sizes=[8, 8, 8]):
+    def _replace_pooling_layers(self, stride= [2,2,2,2], pool_sizes=[8, 8, 8,16]):
         for i, layer in enumerate(self.enc):
             if isinstance(layer, SerializedPooling):
                 self.enc[i] = SortedWindowPooling(
                     in_channels=layer.in_channels,
                     out_channels=layer.out_channels,
                     pool_size=pool_sizes[i] if i < len(pool_sizes) else 8,
+                    stride=stride[i] if i < len(stride) else 2,
                     code_depth=self.code_depth,
                     traceable=True,
                 )
@@ -756,13 +1037,14 @@ class OPTNet(PointTransformerV3):
             code_mins = target_codes.min(dim=1, keepdim=True)[0]
             code_maxs = target_codes.max(dim=1, keepdim=True)[0]
             z_targets = (target_codes - code_mins) / (code_maxs - code_mins + 1e-6)
-
+            labels = data_dict.get("segment", None) if self.use_labels_in_loss else None
             loss_ord, loss_dict = self.sorter.compute_loss(
                 learned_scores,
                 point.coord,
                 point.batch,
                 point.offset,
                 z_target=z_targets, # Passes shape [4, N] natively
+                labels=labels
             )
 
             
