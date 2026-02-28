@@ -23,8 +23,8 @@ model = dict(
         warmup_epoch=5,                # Start using learned order from epoch 0
         enable_score_concat = True, # Whether to concatenate the score to the features for the main loss
         tau=0.1,                    # Temperature for global feature contrastive loss
-        loss_weights=[0, 0, 1, 1],   # Only global feature loss for now (locality losses set to 0)
-        
+        loss_weights=[1.0, 1.0, 1.0, 1.0],   # Only global feature loss for now (locality losses set to 0)
+        use_labels_in_loss=True, # Whether to fuse GT segment labels into the Sorter loss
         # ============================================
         # PTv3 Backbone Parameters
         # ============================================
