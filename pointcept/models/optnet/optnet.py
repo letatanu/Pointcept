@@ -142,7 +142,16 @@ class OffsetSorter(nn.Module):
 
     def forward(self, point):
         # 1. Get the perfect deterministic spatial code already calculated by PTv3
-        z_code = point.serialized_code[0].float()
+        # z_code = point.serialized_code[0].float()
+        z = point.serialized_code
+        # Handle both [1, N] tensor and list of tensors
+        if hasattr(z, "dim") and z.dim() == 2:
+            z = z[0]
+        elif isinstance(z, (list, tuple)):
+            z = z[0]
+            
+        z_code = z.float()
+
         
         # Normalize the base score to [0, 1]
         base_score = (z_code - z_code.min()) / (z_code.max() - z_code.min() + 1e-6)
@@ -283,7 +292,7 @@ class SortedWindowPooling(nn.Module):
         new_point = Point()
         new_point.coord = centroid # Use computed centroid as coordinate
         
-        # BUG FIX: Divide grid_coord by `stride` (e.g., 2), NOT `pool_size`
+        # Divide grid_coord by `stride` (e.g., 2), NOT `pool_size`
         new_point.grid_coord = torch.div(
             point.grid_coord[center_orig_idx], self.stride, rounding_mode='floor'
         )
@@ -294,19 +303,32 @@ class SortedWindowPooling(nn.Module):
         # ------------------------------------------------------------------
         # 4. Pool scores & serialization logic
         # ------------------------------------------------------------------
-        sorted_scores  = point.scores[valid_orig_idx]
-        pooled_scores  = sorted_scores.view(n_groups, P, -1).mean(dim=1)
-        new_point.scores = pooled_scores
+        # sorted_scores  = point.scores[valid_orig_idx]
+        # pooled_scores  = sorted_scores.view(n_groups, P, -1).mean(dim=1)
+        # new_point.scores = pooled_scores
 
-        code       = scores_to_hierarchical_code(pooled_scores, new_point.batch, depth=self.code_depth)
-        code_2d    = code.unsqueeze(0)
-        new_order  = torch.argsort(code_2d, dim=1)
-        new_inverse = torch.zeros_like(new_order).scatter_(
-            1, new_order,
-            torch.arange(new_order.shape[1], device=device).unsqueeze(0).expand_as(new_order)
-        )
-        
-        new_point.serialized_code    = code_2d
+        # code       = scores_to_hierarchical_code(pooled_scores, new_point.batch, depth=self.code_depth)
+        # code_2d    = code.unsqueeze(0)
+        # new_order  = torch.argsort(code_2d, dim=1)
+        # new_inverse = torch.zeros_like(new_order).scatter_(
+        #     1, new_order,
+        #     torch.arange(new_order.shape[1], device=device).unsqueeze(0).expand_as(new_order)
+        # )
+        # Create a dummy code that just counts up [0, 1, 2, ..., n_groups-1]
+        # We add the batch ID to the high bits just like standard PTv3 serialization
+        batch_shifted = new_point.batch.long() << 30 # Shift batch ID to high bits
+        sequential_code = torch.arange(n_groups, dtype=torch.long, device=device)
+        new_code = batch_shifted + sequential_code
+
+        new_code_2d = new_code.unsqueeze(0) # Shape: [1, n_groups]
+
+        # 2. Because they are sequential, the order is just 0 to n_groups-1
+        new_order = torch.arange(n_groups, dtype=torch.long, device=device).unsqueeze(0)
+
+        # 3. And the inverse mapping is identical to the order
+        new_inverse = new_order.clone()
+
+        new_point.serialized_code    = new_code_2d
         new_point.serialized_order   = new_order
         new_point.serialized_inverse = new_inverse
         new_point.serialized_depth   = self.code_depth
@@ -761,6 +783,72 @@ class ResidualBlock(nn.Module):
 
 class PointSorter(nn.Module):
     """
+    Lightweight Sorter that uses PTv3's perfect spatial Z-code as a base,
+    and applies a learned semantic offset via a simple MLP.
+    """
+    def __init__(self, in_channels=6, hidden_channels=64, ordering_k=16, loss_weights=[1, 0, 0, 1], tau=0.1, num_classes=13, ignore_index=-1):
+        super().__init__()
+        self.num_classes = num_classes
+        # self.ignore_index = ignore_index
+        
+        # Tiny, fast MLP. No Fourier features or ResNet blocks required.
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.BatchNorm1d(hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, 1),
+            nn.Tanh() # Bounds the output to [-1, 1]
+        )
+        
+        # Scale factor limits how far a point can jump in the sorted list
+        self.offset_scale = 0.05 
+        
+        # NOTE: Make sure your loss_weights has a value > 0 for the first element (locality)
+        self.ordering_loss = OrderingLoss(ordering_k=ordering_k, loss_weights=loss_weights, tau=tau, ignore_index=-1)
+
+    def forward(self, point):
+        # 1. Get the perfect deterministic spatial code calculated by PTv3
+        # z_code = point.serialized_code[0].float()
+        z = point.serialized_code
+        # Handle both [1, N] tensor and list of tensors
+        if hasattr(z, "dim") and z.dim() == 2:
+            z = z[0]
+        elif isinstance(z, (list, tuple)):
+            z = z[0]
+            
+        z_code = z.float()
+        
+        # Normalize the base score to [0, 1]
+        base_score = (z_code - z_code.min()) / (z_code.max() - z_code.min() + 1e-6)
+        
+        # 2. Predict the semantic offset using Coord(3) + Color(3)
+        inp = point.feat if point.feat is not None else point.coord
+        offset = self.mlp(inp).squeeze(-1)
+        
+        # 3. Final Score = Spatial Base + Semantic Nudge
+        final_scores = base_score + (offset * self.offset_scale)
+        
+        # Clamp to avoid extreme outliers
+        learned_scores = torch.clamp(final_scores, min=1e-5, max=1 - 1e-5).unsqueeze(1)
+        
+        # Store for loss computation
+        if self.training:
+            self._last_feat = self.mlp[0:3](inp) # Save hidden features for global loss
+            
+        return learned_scores
+
+    def compute_loss(self, scores, coords, batch_ids, offset, z_target=None, labels=None):
+        features = getattr(self, '_last_feat', None)
+        return self.ordering_loss(
+            scores, coords, batch_ids, offset, 
+            z_target=z_target, 
+            features=features,
+            labels=labels # IMPORTANT: Pass labels down to OrderingLoss
+        )
+
+
+class PointSorter_old(nn.Module):
+    """
     Upgraded Sorter with Fourier Embeddings + ResNet.
     Input: point.feat (coord + color)
     """
@@ -947,40 +1035,69 @@ class OPTNet(PointTransformerV3):
     #             # Replace in the sequential container
     #             self.enc[i] = grid_pool
 
-    def _replace_pooling_layers(self, stride= [2,2,2,2], pool_sizes=[8, 8, 8,16]):
+    def _replace_pooling_layers(self, stride=(2, 2, 2, 2), pool_sizes=(8, 8, 8, 16)):
+        pool_idx = 0
         for i, layer in enumerate(self.enc):
             if isinstance(layer, SerializedPooling):
+                ps = pool_sizes[pool_idx] if pool_idx < len(pool_sizes) else pool_sizes[-1]
+                st = stride[pool_idx] if pool_idx < len(stride) else stride[-1]
                 self.enc[i] = SortedWindowPooling(
                     in_channels=layer.in_channels,
                     out_channels=layer.out_channels,
-                    pool_size=pool_sizes[i] if i < len(pool_sizes) else 8,
-                    stride=stride[i] if i < len(stride) else 2,
+                    pool_size=ps,
+                    stride=st,
                     code_depth=self.code_depth,
                     traceable=True,
                 )
+                pool_idx += 1
+
 
     def _build_serialization_from_scores(self, scores, point):
-        code    = scores_to_hierarchical_code(scores, point.batch,
-                                              depth=self.code_depth)
-        code_2d = code.unsqueeze(0)
-
-        order   = torch.argsort(code_2d, dim=1)
+        # 1. We must sort per-batch. To do this with floats, we can add a large batch offset.
+        # Scores are in [0, 1]. If we add (batch_id * 10.0), then batch 0 is [0, 1], batch 1 is [10, 11], etc.
+        # This guarantees points are sorted first by batch, then by score.
+        batch_offsets = point.batch.float() * 10.0
+        batch_aware_scores = scores.view(-1) + batch_offsets
+        
+        # 2. Sort the float scores directly
+        order = torch.argsort(batch_aware_scores).unsqueeze(0) # [1, N]
+        
+        # 3. Compute inverse mapping
         inverse = torch.zeros_like(order).scatter_(
-            dim=1,
-            index=order,
-            src=torch.arange(
-                order.shape[1], device=order.device
-            ).unsqueeze(0).expand_as(order),
+            dim=1, 
+            index=order, 
+            src=torch.arange(order.shape[1], device=order.device).unsqueeze(0).expand_as(order)
         )
+        
+        # 4. PTv3 needs `serialized_code` to know batch boundaries during attention.
+        # We can just create a simple sequential integer array, but put the batch ID in the high bits.
+        # This perfectly mimics what PTv3 expects without needing to quantize the actual floats.
+        N = order.shape[1]
+        sorted_batch = point.batch[order[0]]
+        sequential_code = torch.arange(N, dtype=torch.long, device=order.device)
+        
+        # Shift batch ID to top bits (depth*3) just like original PTv3, add sequential ID
+        shift_bits = self.code_depth * 3
+        new_code = (sorted_batch.long() << shift_bits) | sequential_code
+        
+        # We need to map this sorted code BACK to the original point order 
+        # so that `point.serialized_code` matches `point.coord`.
+        original_order_code = torch.zeros_like(new_code)
+        original_order_code[order[0]] = new_code
+        code_2d = original_order_code.unsqueeze(0)
 
-        point.serialized_code    = code_2d
-        point.serialized_order   = order
+        # 5. Assign to point
+        point.serialized_code = code_2d
+        point.serialized_order = order
         point.serialized_inverse = inverse
-        point.serialized_depth   = self.code_depth
+        point.serialized_depth = self.code_depth
+
 
     def forward(self, data_dict):
         point         = Point(data_dict)
-        
+        # Ensure PTv3 serialization exists for OffsetSorter (needed in eval too)
+        point.serialization(order=self.order, shuffle_orders=False, compute_codes=True)
+
         current_epoch = data_dict.get("epoch", 0) if self.training else float("inf")
         use_learned   = current_epoch >= self.warmup_epoch
 
@@ -1013,6 +1130,11 @@ class OPTNet(PointTransformerV3):
                 )
         else:
             target_codes = None
+            point.serialization(
+                order=self.order,        
+                shuffle_orders=False,  
+                compute_codes=True,
+            )
 
 
         # ------------------------------------------------------------------
