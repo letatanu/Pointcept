@@ -15,7 +15,7 @@ echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 MODEL_NAME="optnet"
 EXP_NAME="optnet_1dpooling_08"
 ## --------------------------------------------------------- ##
-DATASET="s3dis"
+DATASET="scannet"
 echo "Model Name: $MODEL_NAME"
 echo "Devices: $DEVICES"
 
