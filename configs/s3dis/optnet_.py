@@ -1,48 +1,32 @@
-# config_optnet_NO.py
+# config_optnet_contrastive.py
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size =6          # NO: reduced from 12 — GNO neighbor search uses more memory
+batch_size = 12
 mix_prob = 0.8
 empty_cache = False
-enable_amp = True
-amp_dtype = 'bfloat16'
+enable_amp = True  # False → True
+amp_dtype = 'bfloat16'  # More stable than float16 on A100/H100
 clip_grad = 35.0
-
 # model settings
 model = dict(
     type="OPTNetSegmentor",
     backbone=dict(
-        type="OPTNet",          # NO: same class name — OPTNet now uses PointSorterNO internally
+        type="OPTNet",
         in_channels=6,
-
+        
         # ============================================
-        # NO: Ordering / Neural Operator Parameters
+        # Ordering Loss Parameters
         # ============================================
-        ordering_loss_weight=0.5,   # NO: reduced from 1.0 — GNO loss is simpler (dist only)
-        ordering_k=16,              # kept — used by OrderingLoss fallback if needed
-        warmup_epoch=3,             # NO: reduced from 5 — GNO converges faster (no locality warmup needed)
-        enable_score_concat=True,
-        tau=0.1,
-        loss_weights=[1, 0.5, 0, 0],  # NO: changed from [0,0,0,1] → enable only distribution loss
-                                    #     locality (w_loc=0): handled architecturally by GNO
-                                    #     global feature (w_glob=0): remove contrastive, keep dist
-
-        # NO: New parameters for PointSorterNO
-        # radius must match your voxel/scene scale.
-        # grid_size=0.02 → radius=0.04 (2x voxel) is a good start
-        # This is passed to PointSorterNO(radius=...) inside OPTNet.__init__
-        # Add this field to OPTNet.__init__ kwargs and forward to PointSorterNO:
-        # sorter_radius=0.04,         # NO: NEW — radius for GNO NeighborSearch
-        sorter_hidden_channels=64,  # NO: NEW — hidden dim of GNO layers (same as MLP default)
-        sorter_k=16,
-
-        # NO: SemanticGridPooling parameters
-        num_score_buckets=8,        # kept — number of semantic score splits per voxel
-        code_depth=10,              # kept
-
+        ordering_loss_weight=1.0,      # Overall weight for ordering loss
+        ordering_k=16,                 # k-NN for locality loss
+        warmup_epoch=5,                # Start using learned order from epoch 0
+        enable_score_concat = True, # Whether to concatenate the score to the features for the main loss
+        tau=0.1,                    # Temperature for global feature contrastive loss
+        loss_weights=[0, 0, 0, 1.0],   # Only global feature loss for now (locality losses set to 0)
+        # use_labels_in_loss=True, # Whether to fuse GT segment labels into the Sorter loss
         # ============================================
-        # PTv3 Backbone Parameters — UNCHANGED
+        # PTv3 Backbone Parameters
         # ============================================
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
@@ -81,7 +65,7 @@ model = dict(
     backbone_out_channels=64,
 )
 
-# scheduler settings — UNCHANGED
+# scheduler settings
 epoch = 3000
 eval_epoch = 100
 optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.05)
@@ -94,7 +78,7 @@ scheduler = dict(
     final_div_factor=1000.0,
 )
 
-# dataset settings — UNCHANGED
+# dataset settings
 dataset_type = "S3DISDataset"
 data_root = "data/S3DIS/pointcept"
 
@@ -102,9 +86,19 @@ data = dict(
     num_classes=13,
     ignore_index=-1,
     names=[
-        "ceiling", "floor", "wall", "beam", "column",
-        "window", "door", "table", "chair", "sofa",
-        "bookcase", "board", "clutter",
+        "ceiling",
+        "floor",
+        "wall",
+        "beam",
+        "column",
+        "window",
+        "door",
+        "table",
+        "chair",
+        "sofa",
+        "bookcase",
+        "board",
+        "clutter",
     ],
     train=dict(
         type=dataset_type,
@@ -113,15 +107,18 @@ data = dict(
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
+            # Rotation
             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             dict(type="RandomRotate", angle=[-1/64, 1/64], axis="x", p=0.5),
             dict(type="RandomRotate", angle=[-1/64, 1/64], axis="y", p=0.5),
             dict(type="RandomScale", scale=[0.9, 1.1]),
             dict(type="RandomFlip", p=0.5),
             dict(type="RandomJitter", sigma=0.005, clip=0.02),
+            # Color augmentation
             dict(type="ChromaticAutoContrast", p=0.2, blend_factor=None),
             dict(type="ChromaticTranslation", p=0.95, ratio=0.05),
             dict(type="ChromaticJitter", p=0.95, std=0.05),
+            # Voxelization
             dict(
                 type="GridSample",
                 grid_size=0.02,
@@ -202,7 +199,7 @@ data = dict(
     ),
 )
 
-# hook — UNCHANGED
+# hook
 hooks = [
     dict(type="CheckpointLoader"),
     dict(type="IterationTimer", warmup_iter=2),
@@ -212,6 +209,6 @@ hooks = [
     dict(type="PreciseEvaluator", test_last=False),
 ]
 
-# runtime — UNCHANGED
+# runtime
 train = dict(type="DefaultTrainer")
 test = dict(type="SemSegTester", verbose=True)
