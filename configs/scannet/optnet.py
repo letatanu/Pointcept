@@ -2,7 +2,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 12  # match PTv3 ScanNet total BS
+batch_size = 24  # match PTv3 ScanNet total BS
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -25,6 +25,7 @@ model = dict(
         warmup_epoch=5,
         enable_score_concat=True,
         tau=0.1,
+        loss_weights=[0, 0, 0, 1.0],  # Only global feature loss for now (locality losses set to 0)
 
         # ============================================
         # PTv3 Backbone Parameters (same as PTv3 ScanNet)
@@ -69,10 +70,11 @@ model = dict(
 
 # scheduler settings (keep PTv3 ScanNet schedule)
 epoch = 3000
+eval_epoch = 100
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
+    max_lr=optimizer["lr"],
     pct_start=0.05,
     anneal_strategy="cos",
     div_factor=10.0,
@@ -82,7 +84,7 @@ param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
 dataset_type = "ScanNetDataset"
-data_root = "data/scannet"
+data_root = "data/ScanNet/pointcept"
 
 data = dict(
     num_classes=20,
