@@ -1,1 +1,1 @@
-from .optnet_NO import *
+from .NOPNet import *
