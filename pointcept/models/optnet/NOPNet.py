@@ -341,30 +341,30 @@ class OPTNet(PointTransformerV3):
 
     def forward(self, data_dict):
         point = Point(data_dict)
-        point.serialization(
-            order=self.order,
-            shuffle_orders=False,
-            compute_codes=True,
-        )
+        point.serialization(order=self.order, shuffle_orders=False, compute_codes=True)
         point.sparsify()
 
-        # Initialize the pooling loss in the dictionary before the encoder
         if self.training:
-            point["no_pooling_loss"] = torch.tensor(0.0, device=point.coord.device)
+            point["no_pooling_loss"] = torch.tensor(0.0, device=point.coord.device,
+                                                    requires_grad=False)
 
         point = self.embedding(point)
-        # self.enc will sequentially call each NOSuperpointPooling,
-        # which will add to point["no_pooling_loss"]
         point = self.enc(point)
 
-        # Scale the accumulated loss by the weight factor
+        # ── save BEFORE decoder overwrites point ──
+        no_pooling_loss = None
         if self.training and "no_pooling_loss" in point.keys():
-            point["no_pooling_loss"] = point["no_pooling_loss"] * self.no_pooling_loss_weight
+            no_pooling_loss = point["no_pooling_loss"] * self.no_pooling_loss_weight
 
         if not self.enc_mode:
             point = self.dec(point)
-            
+
+        # ── re-attach after decoder ──
+        if no_pooling_loss is not None:
+            point["no_pooling_loss"] = no_pooling_loss
+
         return point
+
 
 
 
