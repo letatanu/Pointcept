@@ -2,7 +2,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size =6          # NO: reduced from 12 — GNO neighbor search uses more memory
+batch_size = 4         # NO: reduced from 12 — GNO neighbor search uses more memory
 mix_prob = 0.8
 empty_cache = False
 enable_amp = True

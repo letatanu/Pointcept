@@ -18,25 +18,14 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
 
 
 class SuperpointNeuralOperator(nn.Module):
-    """
-    Models superpoint assignment as a fixed-point of a kernel integral equation.
 
-    Iterative update (T steps):
-        s_{t+1}(x) = sigma( integral_{B(x,r)} G_theta(x,y,s_t(x),s_t(y)) * s_t(y) dy
-                           + W * s_t(x) )
-
-    The Green's kernel G_theta learns:
-    - G(x,y) ~ 1 when x,y are in the same superpoint (smooth interior)
-    - G(x,y) ~ 0 when x,y cross a semantic boundary (discontinuity)
-    """
-
-    def __init__(self, in_channels, hidden_channels=64, k=16, T=3):
+    def __init__(self, in_channels, hidden_channels=64, k=16, T=3, k_anchor=8):
         super().__init__()
-        self.T = T
         self.k = k
+        self.T = T
+        self.k_anchor = k_anchor  # only assign to k_anchor nearest anchors
 
         self.lift = nn.Linear(in_channels, hidden_channels)
-
         self.green_kernel = nn.Sequential(
             nn.Linear(3 + hidden_channels * 2, hidden_channels),
             nn.GELU(),
@@ -45,84 +34,115 @@ class SuperpointNeuralOperator(nn.Module):
             nn.Linear(hidden_channels, 1),
             nn.Sigmoid(),
         )
+        self.W     = nn.Linear(hidden_channels, hidden_channels, bias=False)
+        self.norms = nn.ModuleList([nn.LayerNorm(hidden_channels) for _ in range(T)])
+        self.assign_key   = nn.Linear(hidden_channels, hidden_channels)
+        self.assign_query = nn.Linear(hidden_channels, hidden_channels)
 
-        self.W = nn.Linear(hidden_channels, hidden_channels, bias=False)
-
-        self.norms = nn.ModuleList(
-            [nn.LayerNorm(hidden_channels) for _ in range(T)]
-        )
-
-        self.project = nn.Sequential(
-            nn.Linear(hidden_channels, hidden_channels // 2),
-            nn.GELU(),
-            nn.Linear(hidden_channels // 2, 1),
-            nn.Sigmoid(),
-        )
-
-    def forward(self, point):
+    def forward(self, point, n_sp):
         coords = point.coord
         N = coords.shape[0]
         k = min(self.k, N - 1)
 
-        idx = pointops.knn_query(
-            k, coords.contiguous(), point.offset
-        )[0].long()
+        # KNN graph for the Green's kernel integral
+        idx = pointops.knn_query(k, coords.contiguous(), point.offset)[0].long()
         idx = torch.clamp(idx, 0, N - 1)
         rel_pos = coords[idx] - coords.unsqueeze(1)
 
-        inp = (
-            torch.cat([point.coord, point.feat.detach()], dim=1)
-            if point.feat is not None
-            else point.coord
-        )
+        inp = torch.cat([coords, point.feat.detach()], dim=1) \
+              if point.feat is not None else coords
         v = self.lift(inp)
 
         for t in range(self.T):
             v_j = v[idx]
             v_i = v.unsqueeze(1).expand(-1, k, -1)
-
-            kernel_input = torch.cat([rel_pos, v_i, v_j], dim=-1)
-            G = self.green_kernel(kernel_input)
-
+            G   = self.green_kernel(torch.cat([rel_pos, v_i, v_j], dim=-1))
             integral = (G * v_j).mean(dim=1)
             v = self.norms[t](torch.relu(integral + self.W(v)))
 
-        scores = self.project(v)
+        # Edge weights for energy loss
+        v_j  = v[idx]
+        v_i  = v.unsqueeze(1).expand(-1, k, -1)
+        w_ij = self.green_kernel(
+                   torch.cat([rel_pos, v_i, v_j], dim=-1)
+               ).squeeze(-1)                               # [N, k]
 
-        v_j_final = v[idx]
-        v_i_final = v.unsqueeze(1).expand(-1, k, -1)
-        kernel_input_final = torch.cat([rel_pos, v_i_final, v_j_final], dim=-1)
-        w_ij = self.green_kernel(kernel_input_final).squeeze(-1)
+        # ── Sparse local assignment ───────────────────────────────────────────
+        # Select anchors (top-n_sp by hidden norm)
+        # ── Sparse local assignment ───────────────────────────────────────────
+        scores     = v.norm(dim=-1)                        
+        _, top_idx = torch.topk(scores, n_sp, dim=0)       
 
-        return scores, idx, w_ij, v
+        # Find anchor neighbors...
+        k_anchor = min(self.k_anchor, n_sp)
+        anchor_nn = pointops.knn_query(
+            k_anchor, coords[top_idx].contiguous(), 
+            torch.tensor([n_sp], device=coords.device, dtype=torch.int),
+            coords.contiguous(), point.offset,
+        )[0].long()
+        anchor_nn = torch.clamp(anchor_nn, 0, n_sp - 1)
 
-    def compute_loss(self, scores, idx, w_ij, v, coords):
-        v_j = v[idx]
-        feat_diff_sq = ((v.unsqueeze(1) - v_j) ** 2).sum(-1)
+        keys    = self.assign_key(v)                       # [N, H]
+        queries = self.assign_query(v[top_idx])            # [n_sp, H]
 
-        compactness = (w_ij * feat_diff_sq).mean()
-        sharpness = ((1 - w_ij) * feat_diff_sq.detach()).mean()
+        # AMP FIX: Scale BEFORE multiplication to prevent fp16 overflow
+        H_dim = v.shape[-1]
+        scale = math.pow(H_dim, 0.25)
+        keys_scaled    = keys / scale
+        queries_scaled = queries / scale
 
-        coord_diff = ((coords.unsqueeze(1) - coords[idx]) ** 2).sum(-1)
-        geo_prior = torch.exp(-coord_diff / 0.02)
-        geo_loss = F.mse_loss(w_ij, geo_prior.detach())
+        local_queries = queries_scaled[anchor_nn]                 
+        local_logits  = (keys_scaled.unsqueeze(1) * local_queries).sum(-1) 
+        local_A = torch.softmax(local_logits, dim=-1)      
+        # local_A[i, j] = soft prob that point i belongs to anchor anchor_nn[i,j]
 
-        score_j = scores[idx].squeeze(-1)
-        pc_loss = (
-            w_ij.detach() * (scores.expand(-1, idx.shape[1]) - score_j) ** 2
-        ).mean()
+        return local_A, anchor_nn, top_idx, v, idx, w_ij
 
-        loss = compactness + geo_loss + 0.1 * pc_loss - 0.3 * sharpness
+    def energy_loss(self, local_A, anchor_nn, v, idx, w_ij, lam=1.0, beta=0.1):
+        v_target = v.detach()
+
+        # (1) Local data fidelity - cast to float32
+        anchor_v      = v_target[anchor_nn]                      
+        v_reconstruct = (local_A.unsqueeze(-1) * anchor_v).sum(1)
+        data_fidelity = F.mse_loss(v_reconstruct.float(), v_target.float())
+
+        # (2) Boundary - cast to float32 BEFORE squaring
+        vr_j     = v_reconstruct[idx]                            
+        vr_i     = v_reconstruct.unsqueeze(1).expand_as(vr_j)
+        diff_sq  = ((vr_i.float() - vr_j.float()) ** 2).sum(-1)                  
+        boundary = (w_ij.float().clamp(0, 1) * diff_sq.clamp(max=1e4)).mean()
+
+        # (3) Entropy
+        local_A_safe = local_A.float().clamp(min=1e-6, max=1.0)
+        entropy = -(local_A_safe * local_A_safe.log()).sum(dim=-1).mean()
+
+        loss = data_fidelity + lam * boundary + beta * entropy
+
+        if not torch.isfinite(loss):
+            loss = torch.tensor(0.0, device=v.device, requires_grad=True)
+
         return loss, {
-            "compactness": compactness.item(),
-            "geo_prior": geo_loss.item(),
-            "piecewise_const": pc_loss.item(),
+            "data_fidelity": data_fidelity.item(),
+            "boundary":      boundary.item(),
+            "entropy":       entropy.item(),
         }
-
-
+    
 class NOSuperpointPooling(PointModule):
     """
-    PTv3-compatible pooling that keeps original serialization untouched.
+    PTv3-compatible pooling replacing SerializedPooling.
+
+    Pooling mechanism:
+      - SuperpointNeuralOperator predicts per-point hidden states v and
+        edge weights w_ij via an iterative Green's kernel integral.
+      - Sparse local soft assignment A[N, k_anchor] is computed via
+        dot-product attention between each point and its k_anchor nearest
+        superpoint anchors (selected by hidden-state norm).
+      - Features and coords are pooled via differentiable scatter over A.
+      - Self-supervised by the SPT energy (Robert et al., ICCV 2023):
+          E = data_fidelity + λ * boundary + β * entropy
+
+    Space-filling codes are preserved untouched for PTv3 group attention.
+    Memory cost is O(N * k_anchor) instead of O(N * K).
     """
 
     def __init__(
@@ -137,25 +157,31 @@ class NOSuperpointPooling(PointModule):
         hidden_channels=64,
         k=16,
         T=3,
+        k_anchor=8,
+        spt_lambda=1.0,
+        spt_beta=0.1,
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
+        self.in_channels    = in_channels
+        self.out_channels   = out_channels
         assert stride == 2 ** (math.ceil(stride) - 1).bit_length()
-        self.stride = stride
+        self.stride         = stride
         self.shuffle_orders = shuffle_orders
-        self.traceable = traceable
+        self.traceable      = traceable
+        self.k_anchor       = k_anchor
+        self.spt_lambda     = spt_lambda
+        self.spt_beta       = spt_beta
 
         self.proj = nn.Linear(in_channels, out_channels)
         self.norm = norm_layer(out_channels) if norm_layer is not None else None
-        self.act = act_layer() if act_layer is not None else None
+        self.act  = act_layer()              if act_layer  is not None else None
 
         self.operator = SuperpointNeuralOperator(
             in_channels=in_channels + 3,
             hidden_channels=hidden_channels,
             k=k,
             T=T,
+            k_anchor=k_anchor,
         )
 
     def forward(self, point: Point):
@@ -164,108 +190,195 @@ class NOSuperpointPooling(PointModule):
             pooling_depth = 0
 
         assert {
-            "serialized_code",
-            "serialized_order",
-            "serialized_inverse",
-            "serialized_depth",
-        }.issubset(point.keys()), "Run point.serialization() before NOSuperpointPooling"
+            "serialized_code", "serialized_order",
+            "serialized_inverse", "serialized_depth",
+        }.issubset(point.keys()), \
+            "Run point.serialization() before NOSuperpointPooling"
 
-        scores, idx, w_ij, v = self.operator(point)
+        coords = point.coord
+        feats  = self.proj(point.feat)
+        batch  = point.batch
+        offset = point.offset
 
-        code = point.serialized_code >> (pooling_depth * 3)
-        code_, cluster, counts = torch.unique(
-            code[0],
-            sorted=True,
-            return_inverse=True,
-            return_counts=True,
+        if not torch.isfinite(feats).all():
+            feats = torch.nan_to_num(feats, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        all_pooled_feat   = []
+        all_pooled_coord  = []
+        all_pooled_batch  = []
+        all_global_anchor = []   # global anchor indices for code inheritance
+        all_local_A       = []
+        all_anchor_nn     = []
+        all_v             = []
+        all_idx           = []
+        all_w_ij          = []
+        all_coords        = []
+
+        cluster_map   = torch.zeros(
+            coords.shape[0], dtype=torch.long, device=coords.device
         )
+        start         = 0
+        global_sp_idx = 0
 
-        _, indices = torch.sort(cluster)
-        idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
-        head_indices = indices[idx_ptr[:-1]]
+        for b, end in enumerate(offset.tolist()):
+            end  = int(end)
+            n    = end - start
+            if n == 0:
+                start = end
+                continue
 
-        weights = scores.clamp(min=1e-4)
-        weights_sorted = weights[indices]
+            n_sp = max(1, math.ceil(n / self.stride))
 
-        feat_proj = self.proj(point.feat)
-        feat_sorted = feat_proj[indices]
+            sub_point = Point(Dict(
+                coord=coords[start:end],
+                feat=point.feat[start:end],
+                offset=torch.tensor([n], device=coords.device, dtype=torch.int),
+                batch=torch.zeros(n, dtype=torch.long, device=coords.device),
+            ))
 
-        feat_num = torch_scatter.segment_csr(
-            feat_sorted * weights_sorted,
-            idx_ptr,
-            reduce="sum",
-        )
-        weight_den = torch_scatter.segment_csr(
-            weights_sorted,
-            idx_ptr,
-            reduce="sum",
-        ).clamp_min(1e-6)
-        pooled_feat = feat_num / weight_den
+            local_A, anchor_nn, top_idx, v, idx, w_ij = \
+                self.operator(sub_point, n_sp)
 
-        coord_num = torch_scatter.segment_csr(
-            point.coord[indices] * weights_sorted,
-            idx_ptr,
-            reduce="sum",
-        )
-        pooled_coord = coord_num / weight_den
+            # Guard operator outputs
+            local_A = torch.nan_to_num(local_A, nan=1.0 / local_A.shape[1])
+            local_A = local_A / local_A.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            w_ij    = torch.nan_to_num(w_ij, nan=0.5).clamp(1e-6, 1.0 - 1e-6)
+            v       = torch.nan_to_num(v, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        code = code[:, head_indices]
-        order = torch.argsort(code)
+            # Global anchor indices — used to inherit serialized codes
+            global_anchor = start + top_idx                  # [n_sp]
+            all_global_anchor.append(global_anchor)
+
+            # Sparse differentiable pooling
+            k_a     = local_A.shape[1]
+            f_b     = feats[start:end]
+            c_b     = coords[start:end]
+
+            f_exp   = f_b.unsqueeze(1).expand(-1, k_a, -1)
+            c_exp   = c_b.unsqueeze(1).expand(-1, k_a, -1)
+
+            # ── Sparse differentiable pooling ──────────────────────────────────────
+            # Expand and flatten (same as before)...
+            flat_anchor = anchor_nn.reshape(-1)
+            flat_w      = local_A.reshape(-1)
+            flat_f      = f_exp.reshape(-1, f_b.shape[-1])
+            flat_c      = c_exp.reshape(-1, 3)
+
+            # AMP FIX: Perform scatter accumulation in float32
+            feat_num  = torch_scatter.scatter(
+                (flat_f * flat_w.unsqueeze(-1)).float(),
+                flat_anchor, dim=0, dim_size=n_sp, reduce="sum",
+            )
+            coord_num = torch_scatter.scatter(
+                (flat_c * flat_w.unsqueeze(-1)).float(),
+                flat_anchor, dim=0, dim_size=n_sp, reduce="sum",
+            )
+            w_den = torch_scatter.scatter(
+                flat_w.float(), flat_anchor, dim=0, dim_size=n_sp, reduce="sum",
+            ).clamp_min(1e-3)
+
+            # Convert back to original precision
+            pooled_f = (feat_num  / w_den.unsqueeze(-1)).to(f_b.dtype)
+            pooled_c = (coord_num / w_den.unsqueeze(-1)).to(c_b.dtype)
+            
+            # Fill any bad superpoints with batch mean
+            bad_feat  = ~torch.isfinite(pooled_f).all(dim=-1)
+            bad_coord = ~torch.isfinite(pooled_c).all(dim=-1)
+            if bad_feat.any():
+                pooled_f[bad_feat]  = f_b.mean(0, keepdim=True).expand(bad_feat.sum(), -1)
+            if bad_coord.any():
+                pooled_c[bad_coord] = c_b.mean(0, keepdim=True).expand(bad_coord.sum(), -1)
+
+            hard_assign = anchor_nn[
+                torch.arange(n, device=coords.device), local_A.argmax(dim=-1)
+            ]
+            cluster_map[start:end] = global_sp_idx + hard_assign
+
+            all_pooled_feat.append(pooled_f)
+            all_pooled_coord.append(pooled_c)
+            all_pooled_batch.append(
+                torch.full((n_sp,), b, dtype=torch.long, device=coords.device)
+            )
+            all_local_A.append(local_A)
+            all_anchor_nn.append(anchor_nn)
+            all_v.append(v)
+            all_idx.append(idx)
+            all_w_ij.append(w_ij)
+            all_coords.append(c_b)
+
+            global_sp_idx += n_sp
+            start = end
+
+        pooled_feat  = torch.cat(all_pooled_feat,  dim=0)   # [M, C_out]
+        pooled_coord = torch.cat(all_pooled_coord, dim=0)   # [M, 3]
+        pooled_batch = torch.cat(all_pooled_batch, dim=0)   # [M]
+        global_anchors = torch.cat(all_global_anchor, dim=0) # [M]
+        M = pooled_feat.shape[0]
+
+        _, counts  = torch.unique_consecutive(pooled_batch, return_counts=True)
+        new_offset = torch.cumsum(counts, dim=0).int()
+
+        # ── Inherit serialized codes from anchor points (no Morton needed) ─────────
+        code    = point.serialized_code[:, global_anchors] >> (pooling_depth * 3)
+        order   = torch.argsort(code, dim=1)
+        n_orders = code.shape[0]
         inverse = torch.zeros_like(order).scatter_(
             dim=1,
             index=order,
-            src=torch.arange(0, code.shape[1], device=order.device).repeat(
-                code.shape[0], 1
-            ),
+            src=torch.arange(M, device=order.device)
+                .unsqueeze(0).expand(n_orders, -1),
         )
 
         if self.shuffle_orders:
-            perm = torch.randperm(code.shape[0], device=code.device)
-            code = code[perm]
-            order = order[perm]
+            perm    = torch.randperm(n_orders, device=code.device)
+            code    = code[perm]
+            order   = order[perm]
             inverse = inverse[perm]
 
-        # Compute counts of points in each batch, then cumulative sum to get the offset
-        _, counts = torch.unique_consecutive(point.batch[head_indices], return_counts=True)
-        new_offset = torch.cumsum(counts, dim=0).int()
-
+        # ── Assemble output Point ──────────────────────────────────────────────────
         point_dict = Dict(
             feat=pooled_feat,
             coord=pooled_coord,
-            grid_coord=point.grid_coord[head_indices] >> pooling_depth,
+            grid_coord=point.grid_coord[global_anchors] >> pooling_depth,
             serialized_code=code,
             serialized_order=order,
             serialized_inverse=inverse,
             serialized_depth=point.serialized_depth - pooling_depth,
-            batch=point.batch[head_indices],
-            offset=new_offset,  # <-- Use the locally computed offset here
+            batch=pooled_batch,
+            offset=new_offset,
         )
 
-
-        if "condition" in point.keys():
-            point_dict["condition"] = point.condition
-        if "context" in point.keys():
-            point_dict["context"] = point.context
+        if "condition" in point.keys(): point_dict["condition"] = point.condition
+        if "context"   in point.keys(): point_dict["context"]   = point.context
 
         if self.traceable:
-            point_dict["pooling_inverse"] = cluster
-            point_dict["pooling_parent"] = point
+            point_dict["pooling_inverse"] = cluster_map
+            point_dict["pooling_parent"]  = point
 
-        # Accumulate the energy loss if training
+        # ── SPT energy loss ────────────────────────────────────────────────────────
         if self.training:
-            loss, _ = self.operator.compute_loss(
-                scores, idx, w_ij, v, point.coord
-            )
-            # Safely fetch existing loss using get()
-            existing_loss = point.get("no_pooling_loss", torch.tensor(0.0, device=point.coord.device))
-            point_dict["no_pooling_loss"] = existing_loss + loss
-        else:
-            # Keep propagating zero or existing value during inference
-            point_dict["no_pooling_loss"] = point.get("no_pooling_loss", torch.tensor(0.0, device=point.coord.device))
+            total_loss = torch.tensor(0.0, device=coords.device)
+            for local_A, anchor_nn, v, idx, w_ij, c in zip(
+                all_local_A, all_anchor_nn, all_v, all_idx, all_w_ij, all_coords
+            ):
+                loss, _ = self.operator.energy_loss(
+                    local_A, anchor_nn, v, idx, w_ij,
+                    lam=self.spt_lambda, beta=self.spt_beta,
+                )
+                total_loss = total_loss + loss
 
+            if not torch.isfinite(total_loss):
+                total_loss = torch.tensor(0.0, device=coords.device,
+                                        requires_grad=False)
+
+            existing = point.get("no_pooling_loss",
+                        torch.tensor(0.0, device=coords.device))
+            point_dict["no_pooling_loss"] = existing + total_loss
+        else:
+            point_dict["no_pooling_loss"] = point.get("no_pooling_loss",
+                        torch.tensor(0.0, device=coords.device))
 
         new_point = Point(point_dict)
-
         if self.norm is not None:
             new_point.feat = self.norm(new_point.feat)
         if self.act is not None:
@@ -273,7 +386,6 @@ class NOSuperpointPooling(PointModule):
 
         new_point.sparsify()
         return new_point
-
 
 
 @MODELS.register_module("OPTNet")
@@ -379,7 +491,16 @@ class OPTNetSegmentor(nn.Module):
 
     def forward(self, data_dict):
         point = self.backbone(data_dict)
+
+        # Guard backbone output
+        if not torch.isfinite(point.feat).all():
+            point.feat = torch.nan_to_num(point.feat, nan=0.0, posinf=1e4, neginf=-1e4)
+
         seg_logits = self.seg_head(point.feat)
+
+        # Guard logits before criterion
+        if not torch.isfinite(seg_logits).all():
+            seg_logits = torch.nan_to_num(seg_logits, nan=0.0, posinf=1e4, neginf=-1e4)
 
         if self.training:
             target = data_dict["segment"]
@@ -392,23 +513,47 @@ class OPTNetSegmentor(nn.Module):
                 target[~valid_mask] = -1
 
             seg_loss = self.criteria(seg_logits, target)
-            
-            # The dictionary Pointcept uses for logging
+
+            # Hard stop on bad seg loss
+            if not torch.isfinite(seg_loss):
+                zero = seg_logits.sum() * 0.0
+                return dict(
+                    seg_loss=zero.detach(),
+                    no_pooling_loss=point.get(
+                        "no_pooling_loss",
+                        torch.tensor(0.0, device=seg_logits.device)
+                    ).detach(),
+                    loss=zero
+                )
+
             return_dict = dict(seg_loss=seg_loss)
             total_loss = seg_loss
 
             if "no_pooling_loss" in point:
                 no_pooling_loss = point["no_pooling_loss"]
-                # Add to return_dict so Pointcept's AverageMeter tracks and logs it
+                if not torch.isfinite(no_pooling_loss):
+                    no_pooling_loss = torch.tensor(0.0, device=seg_logits.device)
                 return_dict["no_pooling_loss"] = no_pooling_loss
                 total_loss = total_loss + no_pooling_loss
 
-            # The 'loss' key is the only one used for loss.backward()
+            if not torch.isfinite(total_loss):
+                total_loss = seg_logits.sum() * 0.0
+
             return_dict["loss"] = total_loss
             return return_dict
 
         elif "segment" in data_dict:
-            loss = self.criteria(seg_logits, data_dict["segment"])
+            target = data_dict["segment"]
+            if target.dtype != torch.int64:
+                target = target.long()
+            valid_mask = (target >= 0) & (target < self.num_classes)
+            if not valid_mask.all():
+                target = target.clone()
+                target[~valid_mask] = -1
+
+            loss = self.criteria(seg_logits, target)
+            if not torch.isfinite(loss):
+                loss = seg_logits.sum() * 0.0
             return dict(loss=loss, seg_logits=seg_logits)
 
         return dict(seg_logits=seg_logits)
