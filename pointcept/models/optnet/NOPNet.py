@@ -14,6 +14,7 @@ from pointcept.models.modules import PointModule
 from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
     PointTransformerV3,
     SerializedPooling,
+    SerializedUnpooling,
 )
 
 
@@ -21,7 +22,7 @@ class SuperpointNeuralOperator(nn.Module):
 
     def __init__(self, in_channels, hidden_channels=64, k=16, T=3, k_anchor=8):
         super().__init__()
-        self.k = k
+        self.k = k  
         self.T = T
         self.k_anchor = k_anchor  # only assign to k_anchor nearest anchors
 
@@ -60,12 +61,15 @@ class SuperpointNeuralOperator(nn.Module):
             integral = (G * v_j).mean(dim=1)
             v = self.norms[t](torch.relu(integral + self.W(v)))
 
-        # Edge weights for energy loss
-        v_j  = v[idx]
-        v_i  = v.unsqueeze(1).expand(-1, k, -1)
-        w_ij = self.green_kernel(
-                   torch.cat([rel_pos, v_i, v_j], dim=-1)
-               ).squeeze(-1)                               # [N, k]
+                # Inside SuperpointNeuralOperator.forward()
+        if self.training:
+            v_j  = v[idx]
+            v_i  = v.unsqueeze(1).expand(-1, k, -1)
+            w_ij = self.green_kernel(
+                       torch.cat([rel_pos, v_i, v_j], dim=-1)
+                   ).squeeze(-1).clamp(1e-6, 1.0 - 1e-6)
+        else:
+            w_ij = None  # Skip the heavy MLP calculation during inference
 
         # ── Sparse local assignment ───────────────────────────────────────────
         # Select anchors (top-n_sp by hidden norm)
@@ -213,6 +217,7 @@ class NOSuperpointPooling(PointModule):
         all_idx           = []
         all_w_ij          = []
         all_coords        = []
+        all_global_anchor_nn = []
 
         cluster_map   = torch.zeros(
             coords.shape[0], dtype=torch.long, device=coords.device
@@ -236,14 +241,16 @@ class NOSuperpointPooling(PointModule):
                 batch=torch.zeros(n, dtype=torch.long, device=coords.device),
             ))
 
-            local_A, anchor_nn, top_idx, v, idx, w_ij = \
-                self.operator(sub_point, n_sp)
+            local_A, anchor_nn, top_idx, v, idx, w_ij = self.operator(sub_point, n_sp)
 
             # Guard operator outputs
             local_A = torch.nan_to_num(local_A, nan=1.0 / local_A.shape[1])
             local_A = local_A / local_A.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-            w_ij    = torch.nan_to_num(w_ij, nan=0.5).clamp(1e-6, 1.0 - 1e-6)
-            v       = torch.nan_to_num(v, nan=0.0, posinf=1e4, neginf=-1e4)
+
+            if w_ij is not None:
+                w_ij = torch.nan_to_num(w_ij, nan=0.5).clamp(1e-6, 1.0 - 1e-6)
+
+            v = torch.nan_to_num(v, nan=0.0, posinf=1e4, neginf=-1e4)
 
             # Global anchor indices — used to inherit serialized codes
             global_anchor = start + top_idx                  # [n_sp]
@@ -280,7 +287,7 @@ class NOSuperpointPooling(PointModule):
             # Convert back to original precision
             pooled_f = (feat_num  / w_den.unsqueeze(-1)).to(f_b.dtype)
             pooled_c = (coord_num / w_den.unsqueeze(-1)).to(c_b.dtype)
-            
+
             # Fill any bad superpoints with batch mean
             bad_feat  = ~torch.isfinite(pooled_f).all(dim=-1)
             bad_coord = ~torch.isfinite(pooled_c).all(dim=-1)
@@ -305,6 +312,7 @@ class NOSuperpointPooling(PointModule):
             all_idx.append(idx)
             all_w_ij.append(w_ij)
             all_coords.append(c_b)
+            all_global_anchor_nn.append(global_sp_idx + anchor_nn)
 
             global_sp_idx += n_sp
             start = end
@@ -354,6 +362,8 @@ class NOSuperpointPooling(PointModule):
         if self.traceable:
             point_dict["pooling_inverse"] = cluster_map
             point_dict["pooling_parent"]  = point
+            point_dict["pooling_local_A"] = torch.cat(all_local_A, dim=0)
+            point_dict["pooling_anchor_nn"] = torch.cat(all_global_anchor_nn, dim=0)
 
         # ── SPT energy loss ────────────────────────────────────────────────────────
         if self.training:
@@ -361,6 +371,7 @@ class NOSuperpointPooling(PointModule):
             for local_A, anchor_nn, v, idx, w_ij, c in zip(
                 all_local_A, all_anchor_nn, all_v, all_idx, all_w_ij, all_coords
             ):
+                # w_ij is guaranteed to be a Tensor in training mode
                 loss, _ = self.operator.energy_loss(
                     local_A, anchor_nn, v, idx, w_ij,
                     lam=self.spt_lambda, beta=self.spt_beta,
@@ -368,15 +379,18 @@ class NOSuperpointPooling(PointModule):
                 total_loss = total_loss + loss
 
             if not torch.isfinite(total_loss):
-                total_loss = torch.tensor(0.0, device=coords.device,
-                                        requires_grad=False)
+                total_loss = torch.tensor(0.0, device=coords.device, requires_grad=False)
 
-            existing = point.get("no_pooling_loss",
-                        torch.tensor(0.0, device=coords.device))
+            existing = point.get(
+                "no_pooling_loss",
+                torch.tensor(0.0, device=coords.device)
+            )
             point_dict["no_pooling_loss"] = existing + total_loss
         else:
-            point_dict["no_pooling_loss"] = point.get("no_pooling_loss",
-                        torch.tensor(0.0, device=coords.device))
+            point_dict["no_pooling_loss"] = point.get(
+                "no_pooling_loss",
+                torch.tensor(0.0, device=coords.device)
+            )
 
         new_point = Point(point_dict)
         if self.norm is not None:
@@ -387,6 +401,61 @@ class NOSuperpointPooling(PointModule):
         new_point.sparsify()
         return new_point
 
+class NOSuperpointUnpooling(PointModule):
+    """
+    Symmetric unpooling for NOSuperpointPooling.
+    Reconstructs fine-grained features by applying the exact soft 
+    assignment weights (local_A) that were calculated during pooling.
+    """
+    def __init__(
+        self,
+        in_channels,
+        skip_channels,
+        out_channels,
+        norm_layer=None,
+        act_layer=None,
+    ):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(in_channels, out_channels),
+            norm_layer(out_channels) if norm_layer is not None else nn.Identity(),
+            act_layer() if act_layer is not None else nn.Identity(),
+        )
+        self.proj_skip = nn.Sequential(
+            nn.Linear(skip_channels, out_channels),
+            norm_layer(out_channels) if norm_layer is not None else nn.Identity(),
+            act_layer() if act_layer is not None else nn.Identity(),
+        )
+
+    def forward(self, point: Point):
+        parent = point.pop("pooling_parent")
+        
+        # Retrieve the soft assignments saved during the encoder phase
+        local_A = point.pop("pooling_local_A", None)
+        anchor_nn = point.pop("pooling_anchor_nn", None)
+        
+        if local_A is not None and anchor_nn is not None:
+            # 1. Gather the coarse features for each of the k_anchors
+            feat_anchors = point.feat[anchor_nn]  # [Fine_N, k_anchor, Channels]
+            
+            # 2. Weighted sum using the soft assignment probabilities
+            up_feat = (feat_anchors * local_A.unsqueeze(-1)).sum(dim=1) # [Fine_N, Channels]
+        else:
+            # Fallback to hard unpooling if soft weights are missing
+            inverse = point.pop("pooling_inverse")
+            up_feat = point.feat[inverse]
+
+        # Combine upsampled features with the skip connection from the encoder
+        parent.feat = self.proj(up_feat) + self.proj_skip(parent.feat)
+        
+        # ───> NEW SYNC FIX HERE <───
+        # SpConv modules rely on `sparse_conv_feat` matching `feat` perfectly.
+        # Because we changed the channel dimension of `parent.feat`, we must
+        # replace the features inside the spconv tensor to prevent mismatches.
+        if "sparse_conv_feat" in parent.keys():
+            parent.sparse_conv_feat = parent.sparse_conv_feat.replace_feature(parent.feat)
+            
+        return parent
 
 @MODELS.register_module("OPTNet")
 class OPTNet(PointTransformerV3):
@@ -430,8 +499,9 @@ class OPTNet(PointTransformerV3):
 
         stride = kwargs["stride"] if "stride" in kwargs else (2, 2, 2, 2)
         self._replace_pooling_layers(stride=stride)
-
+    
     def _replace_pooling_layers(self, stride=(2, 2, 2, 2)):
+        # 1. Replace Pooling in Encoder
         pool_idx = 0
         for _, stage in self.enc._modules.items():
             for name, layer in stage._modules.items():
@@ -450,6 +520,23 @@ class OPTNet(PointTransformerV3):
                         T=3,
                     )
                     pool_idx += 1
+                    
+        # 2. Replace Unpooling in Decoder
+        for _, stage in self.dec._modules.items():
+            for name, layer in stage._modules.items():
+                if isinstance(layer, SerializedUnpooling):
+                    # Dynamically extract the channel dimensions from the original PTv3 layer
+                    in_channels = layer.proj[0].in_features
+                    skip_channels = layer.proj_skip[0].in_features
+                    out_channels = layer.proj[0].out_features
+                    
+                    stage._modules[name] = NOSuperpointUnpooling(
+                        in_channels=in_channels,
+                        skip_channels=skip_channels,
+                        out_channels=out_channels,
+                        norm_layer=nn.LayerNorm,
+                        act_layer=nn.GELU,
+                    )
 
     def forward(self, data_dict):
         point = Point(data_dict)
