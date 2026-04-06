@@ -15,20 +15,22 @@ from pointcept.models.modules import PointModule
 # 1. Fast Point Transformer (FPT) Local Attention Block
 # ─────────────────────────────────────────────────────────────────────────────
 class FPTLightweightAttentionBlock(PointModule):
-    def __init__(self, channels, num_heads=4, k=16):
+    def __init__(self, channels, num_heads=4, k=16, use_normal=True):
         super().__init__()
         self.k = k
         self.num_heads = num_heads
         self.channels = channels
         self.head_dim = channels // num_heads
+        self.use_normal = use_normal
 
         self.norm1 = nn.LayerNorm(channels)
         self.qkv = nn.Linear(channels, channels * 3, bias=True)
         self.proj = nn.Linear(channels, channels)
 
-        # FPT Relative Position Encoding: small MLP on relative coordinates
+        # Upgrade Positional Encoding to accept 6D (Rel Pos + Rel Normal)
+        pos_dim = 6 if use_normal else 3
         self.pos_enc = nn.Sequential(
-            nn.Linear(3, channels, bias=False),
+            nn.Linear(pos_dim, channels, bias=False),
             nn.ReLU(inplace=True),
             nn.Linear(channels, channels, bias=False)
         )
@@ -49,31 +51,49 @@ class FPTLightweightAttentionBlock(PointModule):
         k = min(self.k, N - 1) 
         if k <= 0: return point
 
-        # 1. Local Neighborhood via KNN
         idx = pointops.knn_query(k, coords.contiguous(), offset)[0].long()
         idx = torch.clamp(idx, 0, N - 1)
 
-        # 2. QKV Projection
         h = self.norm1(feats)
         qkv = self.qkv(h).view(N, 3, self.num_heads, self.head_dim)
         q, k_v, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
 
-        k_v_gathered = k_v[idx] # [N, K, Heads, HeadDim]
-        v_gathered = v[idx]     # [N, K, Heads, HeadDim]
+        k_v_gathered = k_v[idx] 
+        v_gathered = v[idx]     
 
-        # 3. Relative Positional Encoding
+        # ─── Geometric Encoding with Normals ───
         rel_pos = coords.unsqueeze(1) - coords[idx] # [N, K, 3]
-        pos_emb = self.pos_enc(rel_pos).view(N, k, self.num_heads, self.head_dim)
+        
+        if self.use_normal:
+            if "normal" not in point.keys() or point.normal is None:
+                raise ValueError(
+                    "FPTLightweightAttentionBlock expects 'normal' in the Point dictionary "
+                    "because use_normal=True, but 'normal' was not found. "
+                    "Please add 'normal' to your dataset config's 'Collect' feat_keys."
+                )
+            normals = point.normal
+            rel_normal = normals.unsqueeze(1) - normals[idx] # [N, K, 3]
+            pos_feat = torch.cat([rel_pos, rel_normal], dim=-1) # [N, K, 6]
+        else:
+            pos_feat = rel_pos
+
+        pos_emb = self.pos_enc(pos_feat).view(N, k, self.num_heads, self.head_dim)
 
         # 4. Lightweight Self-Attention
         k_v_gathered = k_v_gathered + pos_emb
-        attn = (q.unsqueeze(1) * k_v_gathered).sum(dim=-1) / math.sqrt(self.head_dim) 
+        
+        # ─── MEMORY OPTIMIZED ATTENTION ───
+        # OLD: attn = (q.unsqueeze(1) * k_v_gathered).sum(dim=-1) / math.sqrt(self.head_dim)
+        # NEW: einsum matches Query [N, Heads, HeadDim] with Keys [N, K, Heads, HeadDim]
+        attn = torch.einsum('nhd,nkhd->nkh', q, k_v_gathered) / math.sqrt(self.head_dim)
         attn = F.softmax(attn, dim=1) 
 
-        out = (attn.unsqueeze(-1) * v_gathered).sum(dim=1) 
+        # OLD: out = (attn.unsqueeze(-1) * v_gathered).sum(dim=1)
+        # NEW: einsum matches Attn [N, K, Heads] with Values [N, K, Heads, HeadDim]
+        out = torch.einsum('nkh,nkhd->nhd', attn, v_gathered)
         out = out.view(N, self.channels)
 
-        # 5. Residual & FFN
+
         feats = feats + self.proj(out)
         feats = feats + self.ffn(self.norm2(feats))
 
@@ -90,7 +110,7 @@ class SuperpointNeuralOperator(nn.Module):
         self.T = T
         self.k_anchor = k_anchor  
 
-        self.lift = nn.Linear(in_channels, hidden_channels)
+        self.lift = nn.Linear(in_channels, hidden_channels) # Now dynamically larger
         self.green_kernel = nn.Sequential(
             nn.Linear(3 + hidden_channels * 2, hidden_channels),
             nn.GELU(),
@@ -113,7 +133,14 @@ class SuperpointNeuralOperator(nn.Module):
         idx = torch.clamp(idx, 0, N - 1)
         rel_pos = coords[idx] - coords.unsqueeze(1)
 
-        inp = torch.cat([coords, point.feat.detach()], dim=1) if point.feat is not None else coords
+        # ─── Concatenate Coords + Normals + Features ───
+        feat_list = [coords]
+        if "normal" in point.keys():
+            feat_list.append(point.normal)
+        if point.feat is not None:
+            feat_list.append(point.feat.detach())
+            
+        inp = torch.cat(feat_list, dim=1)
         v = self.lift(inp)
 
         for t in range(self.T):
@@ -174,22 +201,28 @@ class SuperpointNeuralOperator(nn.Module):
 # 3. Clean NOSuperpointPooling (No PTv3 Serialization!)
 # ─────────────────────────────────────────────────────────────────────────────
 class NOSuperpointPooling(PointModule):
-    def __init__(self, in_channels, out_channels, stride=2, k_anchor=8):
+    def __init__(self, in_channels, out_channels, stride=2, k_anchor=8, use_normal=True):
         super().__init__()
         self.stride = stride
+        self.use_normal = use_normal
         self.proj = nn.Sequential(
             nn.Linear(in_channels, out_channels),
             nn.LayerNorm(out_channels),
             nn.GELU()
         )
+        
+        # Calculate input size for the Operator (Coords=3 + Normal=3 + Feats=in_channels)
+        op_in_channels = in_channels + 6 if use_normal else in_channels + 3
         self.operator = SuperpointNeuralOperator(
-            in_channels=in_channels + 3, hidden_channels=64, k=16, k_anchor=k_anchor
+            in_channels=op_in_channels, hidden_channels=64, k=16, k_anchor=k_anchor
         )
 
     def forward(self, point: Point):
         coords, feats, offset = point.coord, self.proj(point.feat), point.offset
+        normals = point.get("normal", None)
 
         all_pooled_feat, all_pooled_coord, all_pooled_batch = [], [], []
+        all_pooled_normal = [] # Track pooled normals
         all_local_A, all_anchor_nn = [], []
         
         cluster_map = torch.zeros(coords.shape[0], dtype=torch.long, device=coords.device)
@@ -201,10 +234,16 @@ class NOSuperpointPooling(PointModule):
             n = end - start
             n_sp = max(1, math.ceil(n / self.stride))
 
-            sub_point = Point(Dict(
-                coord=coords[start:end], feat=point.feat[start:end],
+            # ─── Build Sub-Point Cloud with Normals ───
+            sub_point_dict = dict(
+                coord=coords[start:end], 
+                feat=point.feat[start:end],
                 offset=torch.tensor([n], device=coords.device, dtype=torch.int)
-            ))
+            )
+            if normals is not None:
+                sub_point_dict["normal"] = normals[start:end]
+                
+            sub_point = Point(Dict(sub_point_dict))
 
             local_A, anchor_nn, _, v, idx, w_ij = self.operator(sub_point, n_sp)
 
@@ -224,13 +263,21 @@ class NOSuperpointPooling(PointModule):
             pooled_f = (feat_num / w_den.unsqueeze(-1)).to(feats.dtype)
             pooled_c = (coord_num / w_den.unsqueeze(-1)).to(coords.dtype)
 
+            # ─── Pool and Normalize the Normal Vectors ───
+            if normals is not None:
+                n_exp = normals[start:end].unsqueeze(1).expand(-1, local_A.shape[1], -1).reshape(-1, 3)
+                normal_num = torch_scatter.scatter((n_exp * flat_w.unsqueeze(-1)).float(), flat_anchor, dim=0, dim_size=n_sp, reduce="sum")
+                pooled_n = (normal_num / w_den.unsqueeze(-1)).to(normals.dtype)
+                pooled_n = F.normalize(pooled_n, p=2, dim=-1) # Ensure they remain valid unit vectors
+                all_pooled_normal.append(pooled_n)
+
             cluster_map[start:end] = global_sp_idx + anchor_nn[torch.arange(n), local_A.argmax(dim=-1)]
             
             all_pooled_feat.append(pooled_f)
             all_pooled_coord.append(pooled_c)
             all_pooled_batch.append(torch.full((n_sp,), b, dtype=torch.long, device=coords.device))
             all_local_A.append(local_A)
-            all_anchor_nn.append(global_sp_idx + anchor_nn) # Save global indices for unpooling
+            all_anchor_nn.append(global_sp_idx + anchor_nn) 
 
             global_sp_idx += n_sp
             start = end
@@ -238,14 +285,18 @@ class NOSuperpointPooling(PointModule):
         pooled_batch = torch.cat(all_pooled_batch, dim=0)
         _, counts = torch.unique_consecutive(pooled_batch, return_counts=True)
         
-        new_point = Point(Dict(
+        # ─── Assemble the New Point ───
+        new_point_dict = dict(
             feat=torch.cat(all_pooled_feat, dim=0),
             coord=torch.cat(all_pooled_coord, dim=0),
             batch=pooled_batch,
             offset=torch.cumsum(counts, dim=0).int(),
-        ))
+        )
+        if all_pooled_normal:
+            new_point_dict["normal"] = torch.cat(all_pooled_normal, dim=0)
+
+        new_point = Point(Dict(new_point_dict))
         
-        # Save pooling weights inside the ENCODER point so the DECODER can use them
         point.pooling_local_A = torch.cat(all_local_A, dim=0)
         point.pooling_anchor_nn = torch.cat(all_anchor_nn, dim=0)
         point.pooling_inverse = cluster_map
@@ -292,7 +343,7 @@ class OPTNet(nn.Module):
         base_channels=32,
         enc_depths=(2, 2, 2, 6, 2),
         dec_depths=(2, 2, 2, 2),
-        fpt_k=16,
+        fpt_k=12,
         ordering_loss_weight=1.0,
         **kwargs
     ):

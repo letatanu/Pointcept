@@ -1,1 +1,1 @@
-from .NOPNet import *
+from .NOPNet_Normal import *
