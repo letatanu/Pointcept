@@ -404,9 +404,6 @@ class OPTNet(nn.Module):
         point = Point(data_dict)
         point.feat = self.embedding(point.feat)
 
-        if self.training:
-            point.no_pooling_loss = torch.tensor(0.0, device=point.coord.device)
-
         # Encoder pass
         # In OPTNet.forward() encoder loop:
 
