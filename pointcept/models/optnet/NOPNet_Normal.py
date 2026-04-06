@@ -430,10 +430,8 @@ class OPTNet(nn.Module):
             point = self.dec_unpools[i](skip_point, point)   # run normally
             point = checkpoint(self.dec_blocks[i], point, use_reentrant=False)  # ✅ checkpoint
 
-        if self.training:
-            point.no_pooling_loss = total_no_pooling_loss * self.no_pooling_loss_weight
-
-        return point
+        
+        return point, total_no_pooling_loss * self.no_pooling_loss_weight
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. Segmentor Wrapper (Unchanged)
@@ -448,7 +446,7 @@ class OPTNetSegmentor(nn.Module):
         self.num_classes = num_classes
 
     def forward(self, data_dict):
-        point = self.backbone(data_dict)
+        point, no_pooling_loss = self.backbone(data_dict)
         seg_logits = self.seg_head(point.feat)
 
         if self.training:
@@ -457,15 +455,13 @@ class OPTNetSegmentor(nn.Module):
             target[~valid_mask] = -1
 
             seg_loss = self.criteria(seg_logits, target)
-            total_loss = seg_loss
+            total_loss = seg_loss + no_pooling_loss
 
-            return_dict = dict(seg_loss=seg_loss)
-            if hasattr(point, "no_pooling_loss"):
-                return_dict["no_pooling_loss"] = point.no_pooling_loss
-                total_loss += point.no_pooling_loss
-
-            return_dict["loss"] = total_loss
-            return return_dict
+            return dict(
+                seg_loss=seg_loss,
+                no_pooling_loss=no_pooling_loss,
+                loss=total_loss,
+            )
 
         loss = self.criteria(seg_logits, data_dict["segment"].long()) if "segment" in data_dict else 0.0
         return dict(loss=loss, seg_logits=seg_logits)
