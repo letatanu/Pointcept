@@ -14,6 +14,7 @@ echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="optnet"
 EXP_NAME="optnet_NO_07"
+CONFIG_PATH="config_optnet_NO"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
 echo "Model Name: $MODEL_NAME"
@@ -31,5 +32,5 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
     sh scripts/train.sh \
       -p python \
       -d ${DATASET} \
-      -c ${MODEL_NAME} \
+      -c ${CONFIG_PATH} \
       -n ${EXP_NAME}"

@@ -2,7 +2,7 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 12         # NO: reduced from 12 — GNO neighbor search uses more memory
+batch_size = 4         # NO: reduced from 12 — GNO neighbor search uses more memory
 mix_prob = 0.8
 empty_cache = False
 enable_amp = True
@@ -46,11 +46,11 @@ model = dict(
         # ============================================
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
-        enc_depths=(2, 4,2),
+        enc_depths=(2, 2, 2, 6, 2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-        dec_depths=(2, 2),
+        dec_depths=(2, 2, 2, 2),
         dec_channels=(64, 64, 128, 256),
         dec_num_head=(4, 4, 8, 16),
         dec_patch_size=(1024, 1024, 1024, 1024),
@@ -78,7 +78,7 @@ model = dict(
         dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
     num_classes=13,
-    backbone_out_channels=32,
+    backbone_out_channels=64,
 )
 
 # scheduler settings — UNCHANGED

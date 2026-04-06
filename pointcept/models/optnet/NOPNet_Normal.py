@@ -10,6 +10,8 @@ from pointcept.models.builder import MODELS
 from pointcept.models.losses import build_criteria
 from pointcept.models.utils.structure import Point
 from pointcept.models.modules import PointModule
+from torch.utils.checkpoint import checkpoint
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. Fast Point Transformer (FPT) Local Attention Block
@@ -65,28 +67,24 @@ class FPTLightweightAttentionBlock(PointModule):
         rel_pos = coords.unsqueeze(1) - coords[idx] # [N, K, 3]
         
         if self.use_normal:
-            if "normal" not in point.keys() or point.normal is None:
-                raise ValueError(
-                    "FPTLightweightAttentionBlock expects 'normal' in the Point dictionary "
-                    "because use_normal=True, but 'normal' was not found. "
-                    "Please add 'normal' to your dataset config's 'Collect' feat_keys."
-                )
             normals = point.normal
-            rel_normal = normals.unsqueeze(1) - normals[idx] # [N, K, 3]
-            pos_feat = torch.cat([rel_pos, rel_normal], dim=-1) # [N, K, 6]
+            rel_pos = coords.unsqueeze(1) - coords[idx]              # [N, K, 3]
+            rel_normal = normals.unsqueeze(1) - normals[idx]         # [N, K, 3]
+            pos_feat = torch.cat([rel_pos, rel_normal], dim=-1)      # [N, K, 6]
         else:
-            pos_feat = rel_pos
+            rel_pos = coords.unsqueeze(1) - coords[idx]              # [N, K, 3]
+            pos_feat = rel_pos                                        # [N, K, 3]
 
-        # pos_emb = self.pos_enc(pos_feat).view(N, k, self.num_heads, self.head_dim)
-        # 1. Project the flat [N, C] tensor FIRST. 
-        # This only processes N points instead of N*K!
-        proj_pos = self.pos_enc(pos_feat)  # Assuming pos is [N, C] (coords or coords+normals)
+        # Summarize relative neighborhood into [N, pos_dim] — memory efficient
+        pos_input = pos_feat.mean(dim=1)                             # [N, 6] or [N, 3]
 
-        # 2. Gather the already-projected features for the neighbors
-        proj_pos_j = proj_pos[idx] # Shape: [N, k, num_heads * head_dim]
+        # Project only N points
+        proj_pos = self.pos_enc(pos_input)                           # [N, C]
 
-        # 3. Calculate the relative encoding via subtraction AFTER the projection
-        pos_emb = (proj_pos.unsqueeze(1) - proj_pos_j).view(N, k, self.num_heads, self.head_dim)
+        # Gather neighbor projections and subtract
+        proj_pos_j = proj_pos[idx]                                   # [N, K, C]
+        pos_emb = (proj_pos.unsqueeze(1) - proj_pos_j)              # [N, K, C]
+        pos_emb = pos_emb.view(N, k, self.num_heads, self.head_dim)
 
         # 4. Lightweight Self-Attention
         k_v_gathered = k_v_gathered + pos_emb
@@ -410,25 +408,30 @@ class OPTNet(nn.Module):
             point.no_pooling_loss = torch.tensor(0.0, device=point.coord.device)
 
         # Encoder pass
+        # In OPTNet.forward() encoder loop:
+
         skip_points = []
+        total_no_pooling_loss = torch.tensor(0.0, device=point.coord.device)
+
         for i in range(len(self.enc_blocks)):
-            point = self.enc_blocks[i](point)
-            skip_points.append(point) # Save for skip connections
-            
+            # ✅ Checkpoint only the attention blocks — pure tensor in/out, no side losses
+            point = checkpoint(self.enc_blocks[i], point, use_reentrant=False)
+            skip_points.append(point)
+
             if i < len(self.enc_pools):
+                # ✅ Run pooling normally — preserves no_pooling_loss attribute
                 point = self.enc_pools[i](point)
+                if self.training and hasattr(point, "no_pooling_loss"):
+                    total_no_pooling_loss = total_no_pooling_loss + point.no_pooling_loss
 
-        # Decoder pass
+        # Decoder loop — checkpoint dec_blocks too (also pure attention, no side losses)
         for i in range(len(self.dec_unpools)):
-            # Pop the corresponding skip connection (reverse order)
-            skip_point = skip_points[-(i + 2)] 
-            
-            # Unpool combines coarse 'point' with fine 'skip_point'
-            point = self.dec_unpools[i](skip_point, point) 
-            point = self.dec_blocks[i](point)
+            skip_point = skip_points[-(i + 2)]
+            point = self.dec_unpools[i](skip_point, point)   # run normally
+            point = checkpoint(self.dec_blocks[i], point, use_reentrant=False)  # ✅ checkpoint
 
-        if self.training and hasattr(point, "no_pooling_loss"):
-            point.no_pooling_loss = point.no_pooling_loss * self.no_pooling_loss_weight
+        if self.training:
+            point.no_pooling_loss = total_no_pooling_loss * self.no_pooling_loss_weight
 
         return point
 
