@@ -136,8 +136,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "grid_coord", "segment"),
-                feat_keys=("coord", "color"),
+                keys=("coord", "grid_coord", "segment", "normal"),
+                feat_keys=("color", "normal"),
             ),
         ],
         test_mode=False,
@@ -162,8 +162,8 @@ data = dict(
             dict(type="ToTensor"),
             dict(
                 type="Collect",
-                keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
-                feat_keys=("coord", "color"),
+                keys=("coord", "grid_coord", "segment", "normal"),
+                feat_keys=("color", "normal"),
             ),
         ],
         test_mode=False,
@@ -191,8 +191,8 @@ data = dict(
                 dict(type="ToTensor"),
                 dict(
                     type="Collect",
-                    keys=("coord", "grid_coord", "index"),
-                    feat_keys=("coord", "color"),
+                    keys=("coord", "grid_coord", "index", "normal"),
+                    feat_keys=("color", "normal"),
                 ),
             ],
             aug_transform=[
