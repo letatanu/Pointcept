@@ -77,7 +77,16 @@ class FPTLightweightAttentionBlock(PointModule):
         else:
             pos_feat = rel_pos
 
-        pos_emb = self.pos_enc(pos_feat).view(N, k, self.num_heads, self.head_dim)
+        # pos_emb = self.pos_enc(pos_feat).view(N, k, self.num_heads, self.head_dim)
+        # 1. Project the flat [N, C] tensor FIRST. 
+        # This only processes N points instead of N*K!
+        proj_pos = self.pos_enc(pos_feat)  # Assuming pos is [N, C] (coords or coords+normals)
+
+        # 2. Gather the already-projected features for the neighbors
+        proj_pos_j = proj_pos[idx] # Shape: [N, k, num_heads * head_dim]
+
+        # 3. Calculate the relative encoding via subtraction AFTER the projection
+        pos_emb = (proj_pos.unsqueeze(1) - proj_pos_j).view(N, k, self.num_heads, self.head_dim)
 
         # 4. Lightweight Self-Attention
         k_v_gathered = k_v_gathered + pos_emb
