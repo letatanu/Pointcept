@@ -6,7 +6,7 @@ num_worker = 24
 mix_prob = 0.8
 empty_cache = False
 enable_amp = True
-
+resume = True
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
@@ -66,7 +66,7 @@ param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
 dataset_type = "S3DISDataset"
-data_root = "data/s3dis"
+data_root = "data/S3DIS/pointcept"
 
 data = dict(
     num_classes=13,

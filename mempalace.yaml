@@ -1,0 +1,45 @@
+wing: pointcept
+rooms:
+- name: run_docker
+  description: Files from run_docker/
+  keywords:
+  - run_docker
+  - run_docker
+- name: exp
+  description: Files from exp/
+  keywords:
+  - exp
+  - exp
+- name: libs
+  description: Files from libs/
+  keywords:
+  - libs
+  - libs
+- name: scripts
+  description: Files from scripts/
+  keywords:
+  - scripts
+  - scripts
+- name: data
+  description: Files from data/
+  keywords:
+  - data
+  - data
+- name: pointcept
+  description: Files from pointcept/
+  keywords:
+  - pointcept
+  - pointcept
+- name: configuration
+  description: Files from configs/
+  keywords:
+  - configuration
+  - configs
+- name: backend
+  description: Files from models/
+  keywords:
+  - backend
+  - models
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []
