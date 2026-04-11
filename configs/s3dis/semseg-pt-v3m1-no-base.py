@@ -1,11 +1,11 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 32  
+batch_size = 12  
 num_worker = 24
 mix_prob = 0.8
-empty_cache = True
+empty_cache = False
 enable_amp = True
-
+resume = True
 model = dict(
     type="DefaultSegmentorV2",
     num_classes=13,
@@ -31,7 +31,7 @@ model = dict(
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-        
+
         # --- Neural Operator Ablation Config ---
         no_stages=(False, False, True, True),  # Apply NO at 16cm and 32cm grids
         fno_modes=8,                           # Number of Fourier modes

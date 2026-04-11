@@ -66,10 +66,10 @@ class NOGlobalBranch(PointModule):
         origin = coord.min(dim=0).values
         shifted = coord - origin
         grid_shape = shifted.max(dim=0).values + 1
-        X, Y, Z = grid_shape.tolist()
-        # MAX = 1028  # tune per GPU memory
-        # X, Y, Z = [min(v, MAX) for v in grid_shape.tolist()]
-        # shifted = shifted.clamp(max=torch.tensor([X-1, Y-1, Z-1], device=shifted.device))
+        # X, Y, Z = grid_shape.tolist()
+        MAX = 1028  # tune per GPU memory
+        X, Y, Z = [min(v, MAX) for v in grid_shape.tolist()]
+        shifted = shifted.clamp(max=torch.tensor([X-1, Y-1, Z-1], device=shifted.device))
         C = feat.shape[1]
 
         # Flatten indices for scatter
@@ -93,6 +93,7 @@ class NOGlobalBranch(PointModule):
         # Exact index lookup back to points (no trilinear needed)
         feat_out = grid_out.squeeze(0).permute(1, 2, 3, 0).reshape(-1, C)[flat_idx]
         del grid_flat, count, grid, grid_out # free memory
+
         return self.norm(feat_out)
 
 class NOFusedPooling(PointModule):
