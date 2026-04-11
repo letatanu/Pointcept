@@ -15,46 +15,38 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
 )
 
 class FNO3dBlock(nn.Module):
-    """3D Fourier Neural Operator block for dense grids (AMP safe)."""
     def __init__(self, channels, modes=8):
         super().__init__()
         self.modes = modes
         scale = 1 / (channels * channels)
-        
-        # FIX: Store real and imaginary parts as standard float32/float16
-        # instead of a single cfloat tensor to prevent AMP GradScaler crash.
         self.weight_real = nn.Parameter(
             scale * torch.rand(channels, channels, modes, modes, modes)
         )
         self.weight_imag = nn.Parameter(
             scale * torch.rand(channels, channels, modes, modes, modes)
         )
-        self.bypass = nn.Conv3d(channels, channels, kernel_size=1)
+        self.bypass = nn.Linear(channels, channels)  # ← changed
 
     def forward(self, x):
         B, C, X, Y, Z = x.shape
-        # FFT to spectral domain
         x_ft = torch.fft.rfftn(x, dim=[-3, -2, -1])
         out_ft = torch.zeros_like(x_ft)
-        
-        # Bound modes to prevent indexing errors on very small spatial grids
+
         mx = min(self.modes, x_ft.shape[2])
         my = min(self.modes, x_ft.shape[3])
         mz = min(self.modes, x_ft.shape[4])
-        
-        # FIX: Reconstruct the complex weight tensor on the fly
+
         weight = torch.complex(self.weight_real, self.weight_imag)
-        
-        # Apply spectral weights
         out_ft[:, :, :mx, :my, :mz] = torch.einsum(
             "bcxyz,cdxyz->bdxyz",
             x_ft[:, :, :mx, :my, :mz],
             weight[:, :, :mx, :my, :mz]
         )
-        
-        # Inverse FFT back to spatial domain
         x_no = torch.fft.irfftn(out_ft, s=(X, Y, Z), dim=[-3, -2, -1])
-        return x_no + self.bypass(x)
+        del x_ft, out_ft  # ← free before bypass
+        # ← changed: reshape for Linear, then restore
+        x_bypass = self.bypass(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
+        return x_no + x_bypass
     
 
 class NOGlobalBranch(PointModule):
@@ -63,6 +55,8 @@ class NOGlobalBranch(PointModule):
         super().__init__()
         self.fno = FNO3dBlock(channels, modes)
         self.norm = norm_layer(channels)
+        self.register_buffer("_grid_buf", None, persistent=False)
+
 
     def forward(self, point: Point):
         feat = point.feat
@@ -73,6 +67,9 @@ class NOGlobalBranch(PointModule):
         shifted = coord - origin
         grid_shape = shifted.max(dim=0).values + 1
         X, Y, Z = grid_shape.tolist()
+        # MAX = 1028  # tune per GPU memory
+        # X, Y, Z = [min(v, MAX) for v in grid_shape.tolist()]
+        # shifted = shifted.clamp(max=torch.tensor([X-1, Y-1, Z-1], device=shifted.device))
         C = feat.shape[1]
 
         # Flatten indices for scatter
@@ -95,6 +92,7 @@ class NOGlobalBranch(PointModule):
 
         # Exact index lookup back to points (no trilinear needed)
         feat_out = grid_out.squeeze(0).permute(1, 2, 3, 0).reshape(-1, C)[flat_idx]
+        del grid_flat, count, grid, grid_out # free memory
         return self.norm(feat_out)
 
 class NOFusedPooling(PointModule):

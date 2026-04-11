@@ -1,9 +1,9 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 10  
+batch_size = 32  
 num_worker = 24
 mix_prob = 0.8
-empty_cache = False
+empty_cache = True
 enable_amp = True
 
 model = dict(
@@ -31,6 +31,7 @@ model = dict(
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
+        
         # --- Neural Operator Ablation Config ---
         no_stages=(False, False, True, True),  # Apply NO at 16cm and 32cm grids
         fno_modes=8,                           # Number of Fourier modes
