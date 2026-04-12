@@ -1,9 +1,10 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 12  
+batch_size = 20  
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
+empty_cache_per_epoch = True
 enable_amp = True
 resume = True
 model = dict(
@@ -44,7 +45,7 @@ model = dict(
     ],
 )
 
-epoch = 3000
+epoch = 5000
 eval_epoch = 100
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
