@@ -25,7 +25,7 @@ model = dict(
         dec_num_head=(4, 4, 8, 16),
         dec_patch_size=(1024, 1024, 1024, 1024),
         mlp_ratio=4,
-        drop_path=0.3,
+        drop_path=0.2,
         shuffle_orders=True,
         pre_norm=True,
         
@@ -36,7 +36,7 @@ model = dict(
         # --- Neural Operator Ablation Config ---
         no_stages=(False, False, True, True),  # Apply NO at 16cm and 32cm grids
         fno_modes=8,                           # Number of Fourier modes
-        use_skip=False,                        # ABLATION: False = pure NO global mapping, no U-Net skip
+        use_skip=True,                        # ABLATION: False = pure NO global mapping, no U-Net skip
         fusion="add",
     ),
     criteria=[
@@ -51,7 +51,7 @@ optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR", 
     max_lr=[0.006, 0.0006],
-    pct_start=0.05,
+    pct_start=0.1,
     anneal_strategy="cos",
     div_factor=10.0,
     final_div_factor=1000.0
@@ -121,7 +121,11 @@ data = dict(
                      keys=("coord", "grid_coord", "index"), 
                      feat_keys=("color", "normal")),
             ],
-            aug_transform=[[dict(type="RandomScale", scale=[1, 1])]],
+            aug_transform=[
+                [dict(type="RandomScale", scale=[0.9, 0.9])],
+                [dict(type="RandomScale", scale=[1.0, 1.0])],
+                [dict(type="RandomScale", scale=[1.1, 1.1])],
+            ],
         ),
     ),
 )
