@@ -1,12 +1,11 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 20  
+batch_size = 12  
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
 empty_cache_per_epoch = True
 enable_amp = True
-resume = True
 model = dict(
     type="DefaultSegmentorV2",
     num_classes=13,
@@ -34,9 +33,9 @@ model = dict(
         upcast_softmax=False,
 
         # --- Neural Operator Ablation Config ---
-        no_stages=(False, False, True, True),  # Apply NO at 16cm and 32cm grids
-        fno_modes=8,                           # Number of Fourier modes
-        use_skip=True,                        # ABLATION: False = pure NO global mapping, no U-Net skip
+        no_stages=(True, True, True, True),  # Apply NO at 16cm and 32cm grids
+        fno_modes=12,                           # Number of Fourier modes
+        use_skip=False,                        # ABLATION: False = pure NO global mapping, no U-Net skip
         fusion="add",
     ),
     criteria=[
