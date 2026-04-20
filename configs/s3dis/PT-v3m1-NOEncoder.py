@@ -1,50 +1,42 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 12  
+batch_size = 32  
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
 empty_cache_per_epoch = True
 enable_amp = True
 model = dict(
-    type="DefaultSegmentorV2",
+    type='DefaultSegmentorV2',
     num_classes=13,
     backbone_out_channels=64,
     backbone=dict(
-        type="PT-v3m1-NO",      # Using our new NO-enabled Backbone
+        type='PT-v3m1-NOEncoder',
         in_channels=6,
-        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+        order=('z', 'z-trans', 'hilbert', 'hilbert-trans'),
         stride=(2, 2, 2, 2),
         enc_depths=(2, 2, 2, 6, 2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-        dec_depths=(2, 2, 2, 2),
-        dec_channels=(64, 64, 128, 256),
-        dec_num_head=(4, 4, 8, 16),
-        dec_patch_size=(1024, 1024, 1024, 1024),
-        mlp_ratio=4,
         drop_path=0.2,
-        shuffle_orders=True,
         pre_norm=True,
-        
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-
-        # --- Neural Operator Ablation Config ---
-        no_stages=(True, True, True, True),  # Apply NO at 16cm and 32cm grids
-        fno_modes=12,                           # Number of Fourier modes
-        use_skip=True,                        # ABLATION: False = pure NO global mapping, no U-Net skip
-        fusion="add",
+        no_stages=(True, True, True, True),
+        fno_modes=12,
+        grid_size=(128, 128, 128),
+        fusion='concat',
+        head_out_channels=64,
     ),
     criteria=[
-        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
-    ],
+        dict(type='CrossEntropyLoss', loss_weight=1.0, ignore_index=-1),
+        dict(type='LovaszLoss', mode='multiclass', loss_weight=1.0, ignore_index=-1),
+    ]
 )
 
-epoch = 5000
+epoch = 3000
 eval_epoch = 100
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
