@@ -548,12 +548,13 @@ class PointTransformerV3(PointModule):
         pdnorm_adaptive=False,
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        shuffle_orders=True
     ):
         super().__init__()
         self.num_stages = len(enc_depths)
         self.order = [order] if isinstance(order, str) else order
         self.enc_mode = enc_mode
-
+        self.shuffle_orders = shuffle_orders
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)
         assert self.num_stages == len(enc_channels)

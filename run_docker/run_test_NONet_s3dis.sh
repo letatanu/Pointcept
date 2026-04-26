@@ -11,10 +11,7 @@ OMP_NUM_THREADS=4
 DOCKER_IMAGE="letatanu/poincept1"
 
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
-
-MODEL_NAME="PT-v3m1-NO"
 EXP_NAME="PT-v3m1-NO-Enhanced_01"
-CONFIG_PATH="semseg-pt-v3-no-base-enchanced"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
 echo "Model Name: $MODEL_NAME"
@@ -29,8 +26,4 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
   -e OMP_NUM_THREADS=${OMP_NUM_THREADS} \
   "${DOCKER_IMAGE}"    \
   bash -lc "
-    sh scripts/train.sh \
-      -p python \
-      -d ${DATASET} \
-      -c ${CONFIG_PATH} \
-      -n ${EXP_NAME}"
+    sh scripts/test.sh -p python -d ${DATASET} -n ${EXP_NAME} -w model_best"

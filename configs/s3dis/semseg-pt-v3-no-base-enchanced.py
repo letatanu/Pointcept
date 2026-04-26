@@ -1,53 +1,56 @@
-# configs/s3dis/semseg-pt-v3m1-no-encoder-enhanced.py
-
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 30
+batch_size = 24
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
 empty_cache_per_epoch = True
 enable_amp = True
-
 model = dict(
-    type='DefaultSegmentorV2',
+    type="DefaultSegmentorV2",
     num_classes=13,
     backbone_out_channels=64,
     backbone=dict(
-        type='PT-v3m1-NOEncoder-Enhanced',  # new model type
+        type="PT-v3m1-NO",  # Using our new NO-enabled Backbone
         in_channels=6,
-        order=('z', 'z-trans', 'hilbert', 'hilbert-trans'),
+        order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
-        enc_depths=(4, 4, 2, 6, 2),
+        enc_depths=(2, 2, 2, 6, 2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        dec_depths=(2, 2, 2, 2),
+        dec_channels=(64, 64, 128, 256),
+        dec_num_head=(4, 4, 8, 16),
+        dec_patch_size=(1024, 1024, 1024, 1024),
+        mlp_ratio=4,
         drop_path=0.2,
+        shuffle_orders=True,
         pre_norm=True,
+
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-        no_stages=(True, True, True, True),
-        fno_modes=12,
-        # --- Enhancement 1: adaptive grid (base; halved per stage internally) ---
-        base_grid_size=(64, 64, 64),        # replaces fixed grid_size=(128,128,128)
-        adaptive_grid=True,                 # enables per-stage grid scaling
-        # --- Enhancement 2: NOLightweightUpsampleHead fusion mode ---
-        head_fusion='concat',               # "sum" | "concat"
-        head_out_channels=64,
-        # --- Enhancement 3: learnable stage weights (always on) ---
-        learnable_stage_weights=True,
-        fusion='concat',
+
+        # --- Neural Operator Config ---
+        no_stages=(True, True, True, True),  
+        fno_modes=12,  
+        use_skip=True,  
+        fusion="concat",
+        
+        # --- Enhancements ---
+        base_grid_size=(64, 64, 64),
+        adaptive_grid=True,
+        learnable_stage_weights=True
     ),
     criteria=[
-        dict(type='CrossEntropyLoss', loss_weight=1.0, ignore_index=-1),
-        dict(type='LovaszLoss', mode='multiclass', loss_weight=1.0, ignore_index=-1),
+        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
+        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
 )
 
-epoch = 3000
+epoch = 5000
 eval_epoch = 100
-
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
     type="OneCycleLR",
@@ -55,7 +58,7 @@ scheduler = dict(
     pct_start=0.1,
     anneal_strategy="cos",
     div_factor=10.0,
-    final_div_factor=1000.0,
+    final_div_factor=1000.0
 )
 
 param_dicts = [dict(keyword="block", lr=0.0006)]
@@ -68,8 +71,7 @@ data = dict(
     names=["ceiling", "floor", "wall", "beam", "column", "window", "door",
            "table", "chair", "sofa", "bookcase", "board", "clutter"],
     train=dict(
-        type=dataset_type,
-        split=("Area_1", "Area_2", "Area_3", "Area_4", "Area_6"),
+        type=dataset_type, split=("Area_1", "Area_2", "Area_3", "Area_4", "Area_6"),
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
