@@ -1,12 +1,12 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 6  # bs: total bs in all gpus
+batch_size = 12  # bs: total bs in all gpus
 # num_worker = 24
 mix_prob = 0.8
 empty_cache = False
-enable_amp = False
-ignore_index = 5
+enable_amp = True
+ignore_index = -1
 enable_wandb = False
 names = ["Building-Damage", "Building-No-Damage",  "Road", "Tree", "Background"]
 grid_size = 0.22
@@ -41,7 +41,7 @@ model = dict(
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-        cls_mode=False,
+        enc_mode=False,
         pdnorm_bn=False,
         pdnorm_ln=False,
         pdnorm_decouple=True,
@@ -50,8 +50,8 @@ model = dict(
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
     ),
     criteria=[
-        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=ignore_index),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=ignore_index),
+        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
+        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
     ],
 )
 
@@ -69,8 +69,8 @@ scheduler = dict(
 param_dicts = [dict(keyword="block", lr=0.00006)]
 
 # dataset settings
-dataset_type = "BinaLab"
-data_root = "/working/data/datasets/BinaLab/pointcept"
+dataset_type = "AeroRelief3DDataset"
+data_root = "data/AeroRelief3D/pointcept"
 
 data = dict(
     num_classes=len(names),
@@ -78,7 +78,7 @@ data = dict(
     names=names,
     train=dict(
         type=dataset_type,
-        split=("Area_1", "Area_3-1", "Area_4", "Area_5", "Area_6", "Area_7", "Area_8"),
+        split=("Area_1", "Area_3", "Area_4", "Area_5", "Area_6", "Area_7", "Area_8"),
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
