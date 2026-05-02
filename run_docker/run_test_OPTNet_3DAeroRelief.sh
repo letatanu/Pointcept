@@ -11,9 +11,7 @@ OMP_NUM_THREADS=4
 DOCKER_IMAGE="letatanu/poincept1"
 
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
-
-MODEL_NAME="optnet"
-EXP_NAME="optnet_02"
+EXP_NAME="optnet_01"
 ## --------------------------------------------------------- ##
 DATASET="aerorelief3d"
 echo "Model Name: $MODEL_NAME"
@@ -25,9 +23,6 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
   -w /working \
   -v /media/volume/data/project/semantic_3d/Pointcept/:/working \
   -e OMP_NUM_THREADS=${OMP_NUM_THREADS} \
-  "${DOCKER_IMAGE}"  bash -lc "
-  sh scripts/train.sh \
-      -p python \
-      -d ${DATASET} \
-      -c ${MODEL_NAME} \
-      -n ${EXP_NAME}"
+  "${DOCKER_IMAGE}"    \
+  bash -lc "
+    sh scripts/test.sh -p python -d ${DATASET} -n ${EXP_NAME} -w model_best"

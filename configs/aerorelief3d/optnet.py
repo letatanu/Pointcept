@@ -1,13 +1,13 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 16  # bs: total bs in all gpus
+batch_size = 32  # bs: total bs in all gpus
 mix_prob = 0.8
 empty_cache = False
 enable_amp = False
 ignore_index = -1
 enable_wandb = False
-names = ["Building-Damage", "Building-No-Damage",  "Road", "Tree", "Background"]
+names = ["Background", "Building-Damage", "Building-No-Damage",  "Road", "Tree"]
 grid_size = 0.2
 
 # model settings
@@ -48,7 +48,7 @@ model = dict(
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
         warmup_epoch = 5,
-        ordering_loss_weight = 1.0
+        ordering_loss_weight = 0.5
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
@@ -71,7 +71,7 @@ param_dicts = [dict(keyword="block", lr=0.0006)]
 
 # dataset settings
 dataset_type = "AeroRelief3DDataset"
-data_root = "data/AeroRelief3D/pcd_1"
+data_root = "data/aerorelief3d/pointcept"
 
 data = dict(
     num_classes=len(names),
