@@ -48,7 +48,8 @@ model = dict(
         pdnorm_affine=True,
         pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
         warmup_epoch = 5,
-        ordering_loss_weight = 0.5
+        ordering_loss_weight = 0.1,
+        ordering_k=24
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),

@@ -11,7 +11,7 @@ OMP_NUM_THREADS=4
 DOCKER_IMAGE="letatanu/poincept1"
 
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
-EXP_NAME="optnet_01"
+EXP_NAME="optnet_05"
 ## --------------------------------------------------------- ##
 DATASET="aerorelief3d"
 echo "Model Name: $MODEL_NAME"
