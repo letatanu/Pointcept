@@ -30,32 +30,55 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
 
 
 # ---------------------------------------------------------------------------
-# FNO3dBlock  (unchanged)
+# FNO3dBlock (With Bottleneck)
 # ---------------------------------------------------------------------------
 
 class FNO3dBlock(nn.Module):
-    def __init__(self, channels: int, modes: int = 8):
+    def __init__(self, channels: int, modes: int = 8, max_fno_channels: int = 64):
         super().__init__()
         self.modes = modes
-        scale = 1.0 / (channels * channels)
+        
+        # Bottleneck: cap the channels used in the expensive C x C x modes^3 multiplication
+        self.use_bottleneck = channels > max_fno_channels
+        self.fno_channels = max_fno_channels if self.use_bottleneck else channels
+
+        if self.use_bottleneck:
+            self.in_proj = nn.Conv3d(channels, self.fno_channels, 1)
+            self.out_proj = nn.Conv3d(self.fno_channels, channels, 1)
+
+        scale = 1.0 / (self.fno_channels * self.fno_channels)
         self.weight_real = nn.Parameter(
-            scale * torch.rand(channels, channels, modes, modes, modes)
+            scale * torch.rand(self.fno_channels, self.fno_channels, modes, modes, modes)
         )
         self.weight_imag = nn.Parameter(
-            scale * torch.rand(channels, channels, modes, modes, modes)
+            scale * torch.rand(self.fno_channels, self.fno_channels, modes, modes, modes)
         )
-        self.bypass = nn.Linear(channels, channels)
+        
+        self.bypass = nn.Conv3d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: B, C, X, Y, Z
         B, C, X, Y, Z = x.shape
-        x_ft = torch.fft.rfftn(x, dim=[-3, -2, -1])
+        
+        # Bottleneck projection
+        x_fno = self.in_proj(x) if self.use_bottleneck else x
+
+        # ==========================================================
+        # AMP FIX: Force FFT and frequency math to float32
+        # ==========================================================
+        orig_dtype = x_fno.dtype
+        x_fno_fp32 = x_fno.to(torch.float32)
+
+        x_ft = torch.fft.rfftn(x_fno_fp32, dim=[-3, -2, -1])
         out_ft = torch.zeros_like(x_ft)
 
         mx = min(self.modes, x_ft.shape[2])
         my = min(self.modes, x_ft.shape[3])
         mz = min(self.modes, x_ft.shape[4])
 
+        # Weights are already float32 parameters, so this yields ComplexFloat
         weight = torch.complex(self.weight_real, self.weight_imag)
+        
         out_ft[:, :, :mx, :my, :mz] = torch.einsum(
             "bcxyz,cdxyz->bdxyz",
             x_ft[:, :, :mx, :my, :mz],
@@ -63,46 +86,49 @@ class FNO3dBlock(nn.Module):
         )
 
         x_no = torch.fft.irfftn(out_ft, s=(X, Y, Z), dim=[-3, -2, -1])
-        del x_ft, out_ft
+        
+        # Cast back to original dtype (float16 if AMP is enabled)
+        x_no = x_no.to(orig_dtype)
+        # ==========================================================
 
-        x_bypass = self.bypass(x.permute(0, 2, 3, 4, 1)).permute(0, 4, 1, 2, 3)
+        # Reverse bottleneck
+        if self.use_bottleneck:
+            x_no = self.out_proj(x_no)
+
+        x_bypass = self.bypass(x)
         return x_no + x_bypass
 
 
 # ---------------------------------------------------------------------------
-# NOGlobalBranch  (unchanged — shared externally)
+# NOGlobalBranch 
 # ---------------------------------------------------------------------------
 
 class NOGlobalBranch(PointModule):
-    """
-    Shared spectral branch.  Owns FNO3dBlock + LayerNorm.
-    grid_size is fixed at construction; callers that need adaptive sizing
-    should pass the appropriate size when building the shared branch dict.
-    """
     def __init__(
         self,
         channels: int,
         modes: int = 8,
         grid_size: tuple = (64, 64, 64),
         norm_layer=nn.LayerNorm,
+        max_fno_channels: int = 64,  # NEW
     ):
         super().__init__()
-        self.fno = FNO3dBlock(channels, modes)
+        self.fno = FNO3dBlock(channels, modes, max_fno_channels)
         self.norm = norm_layer(channels)
-        self.grid_size = grid_size
+        self.grid_size = grid_size 
 
     def forward(self, point: Point) -> torch.Tensor:
-        feat   = point.feat
-        coord  = point.grid_coord
+        feat = point.feat 
+        coord = point.grid_coord 
         Gx, Gy, Gz = self.grid_size
         C = feat.shape[1]
         device, dtype = feat.device, feat.dtype
 
-        coord_f   = coord.float()
+        coord_f = coord.float()
         coord_min = coord_f.min(dim=0).values
         coord_max = coord_f.max(dim=0).values
-        scale     = (coord_max - coord_min).clamp(min=1.0)
-        G_max     = torch.tensor(
+        scale = (coord_max - coord_min).clamp(min=1.0) 
+        G_max = torch.tensor(
             [Gx - 1, Gy - 1, Gz - 1], device=device, dtype=torch.float32
         )
 
@@ -112,10 +138,10 @@ class NOGlobalBranch(PointModule):
             max=G_max.long(),
         )
 
-        flat_idx  = shifted[:, 0] * (Gy * Gz) + shifted[:, 1] * Gz + shifted[:, 2]
+        flat_idx = shifted[:, 0] * (Gy * Gz) + shifted[:, 1] * Gz + shifted[:, 2]
 
         grid_flat = torch.zeros(Gx * Gy * Gz, C, device=device, dtype=dtype)
-        count     = torch.zeros(Gx * Gy * Gz, 1, device=device, dtype=dtype)
+        count = torch.zeros(Gx * Gy * Gz, 1, device=device, dtype=dtype)
 
         grid_flat.scatter_add_(0, flat_idx.unsqueeze(1).expand(-1, C), feat)
         count.scatter_add_(
@@ -132,7 +158,7 @@ class NOGlobalBranch(PointModule):
 
         del grid_flat, count, grid, grid_out
 
-        return self.norm(feat_out)
+        return self.norm(feat_out) 
 
 
 # ---------------------------------------------------------------------------
@@ -430,11 +456,9 @@ class PointTransformerV3_NO(PointModule):
                 )
 
                 # Retrieve shared branch (or None → module will build its own)
-                shared_branch = (
-                    self.shared_no_branches.get(str(in_ch))
-                    if self.shared_no_branches is not None
-                    else None
-                )
+                shared_branch = None
+                if self.shared_no_branches is not None and str(in_ch) in self.shared_no_branches:
+                    shared_branch = self.shared_no_branches[str(in_ch)]
 
                 enc.add(
                     NOFusedPooling(
@@ -495,11 +519,9 @@ class PointTransformerV3_NO(PointModule):
             )
 
             # Retrieve shared branch for this channel dim (may overlap with enc)
-            shared_branch = (
-                self.shared_no_branches.get(str(in_ch))
-                if self.shared_no_branches is not None
-                else None
-            )
+            shared_branch = None
+            if self.shared_no_branches is not None and str(in_ch) in self.shared_no_branches:
+                shared_branch = self.shared_no_branches[str(in_ch)]
 
             dec.add(
                 NOFusedUnpooling(

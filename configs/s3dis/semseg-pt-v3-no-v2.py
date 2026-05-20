@@ -2,7 +2,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 30
+batch_size = 20
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -14,7 +14,7 @@ model = dict(
     num_classes=13,
     backbone_out_channels=64,
     backbone=dict(
-        type='PT-v3m1-NO-SharedBranch',  # new model type
+        type='PT-v3m1-NO-SharedBranch',
         in_channels=6,
         order=('z', 'z-trans', 'hilbert', 'hilbert-trans'),
         stride=(2, 2, 2, 2),
@@ -22,22 +22,26 @@ model = dict(
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        dec_depths=(2, 2, 2, 2),
+        dec_channels=(64, 64, 128, 256),
+        dec_num_head=(4, 4, 8, 16),
+        dec_patch_size=(1024, 1024, 1024, 1024),
+        mlp_ratio=4,
         drop_path=0.2,
         pre_norm=True,
+        shuffle_orders=True,
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
+        # ---- NO parameters ----
         no_stages=(True, True, True, True),
-        fno_modes=12,
-        # --- Enhancement 1: adaptive grid (base; halved per stage internally) ---
-        base_grid_size=(64, 64, 64),        # replaces fixed grid_size=(128,128,128)
-        adaptive_grid=True,                 # enables per-stage grid scaling
-        # --- Enhancement 2: NOLightweightUpsampleHead fusion mode ---
-        head_fusion='concat',               # "sum" | "concat"
-        head_out_channels=64,
-        # --- Enhancement 3: learnable stage weights (always on) ---
-        learnable_stage_weights=True,
+        fno_modes=8,
+        base_grid_size=(64, 64, 64),
+        adaptive_grid=False,        # must be False when share_no_branch=True
+        use_skip=True,
         fusion='concat',
+        learnable_stage_weights=True,
+        share_no_branch=True,       # enables the shared-weight registry
     ),
     criteria=[
         dict(type='CrossEntropyLoss', loss_weight=1.0, ignore_index=-1),
@@ -124,10 +128,32 @@ data = dict(
                      keys=("coord", "grid_coord", "index"),
                      feat_keys=("color", "normal")),
             ],
-            aug_transform=[
+               aug_transform=[
                 [dict(type="RandomScale", scale=[0.9, 0.9])],
-                [dict(type="RandomScale", scale=[1.0, 1.0])],
+                [dict(type="RandomScale", scale=[0.95, 0.95])],
+                [dict(type="RandomScale", scale=[1, 1])],
+                [dict(type="RandomScale", scale=[1.05, 1.05])],
                 [dict(type="RandomScale", scale=[1.1, 1.1])],
+                [
+                    dict(type="RandomScale", scale=[0.9, 0.9]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[0.95, 0.95]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[1, 1]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[1.05, 1.05]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[1.1, 1.1]),
+                    dict(type="RandomFlip", p=1),
+                ],
             ],
         ),
     ),

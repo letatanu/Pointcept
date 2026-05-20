@@ -1,23 +1,26 @@
+# configs/s3dis/semseg-pt-v3m1-no-encoder-enhanced.py
+
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 28  
-# num_worker = 24
+batch_size = 32
+num_worker = 24
 mix_prob = 0.8
 empty_cache = False
 empty_cache_per_epoch = True
 enable_amp = True
-grid_size = 0.22
 names = ["Building-Damage", "Building-No-Damage",  "Road", "Tree", "Background"]
+grid_size = 0.22
+
 model = dict(
-    type="DefaultSegmentorV2",
+    type='DefaultSegmentorV2',
     num_classes=len(names),
     backbone_out_channels=64,
     backbone=dict(
-        type="PT-v3m1-NO",      # Using our new NO-enabled Backbone
+        type='PT-v3m1-NO-SharedBranch',
         in_channels=6,
-        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+        order=('z', 'z-trans', 'hilbert', 'hilbert-trans'),
         stride=(2, 2, 2, 2),
-        enc_depths=(2, 2, 2, 6, 2),
+        enc_depths=(4, 4, 2, 6, 2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
@@ -27,36 +30,40 @@ model = dict(
         dec_patch_size=(1024, 1024, 1024, 1024),
         mlp_ratio=4,
         drop_path=0.2,
-        shuffle_orders=True,
         pre_norm=True,
-        
+        shuffle_orders=True,
         enable_flash=True,
         upcast_attention=False,
         upcast_softmax=False,
-
-        # --- Neural Operator Ablation Config ---
-        no_stages=(True, True, True, True),  # Apply NO at 16cm and 32cm grids
-        fno_modes=12,                           # Number of Fourier modes
-        use_skip=True,                        # ABLATION: False = pure NO global mapping, no U-Net skip
-        fusion="concat",
+        # ---- NO parameters ----
+        no_stages=(True, True, True, True),
+        fno_modes=8,
+        base_grid_size=(64, 64, 64),
+        adaptive_grid=False,        # must be False when share_no_branch=True
+        use_skip=True,
+        fusion='concat',
+        learnable_stage_weights=True,
+        share_no_branch=True,       # enables the shared-weight registry
     ),
     criteria=[
-        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+        dict(type='CrossEntropyLoss', loss_weight=1.0, ignore_index=-1),
+        dict(type='LovaszLoss', mode='multiclass', loss_weight=1.0, ignore_index=-1),
     ],
 )
 
-epoch = 5000
+epoch = 3000
 eval_epoch = 100
+
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
 scheduler = dict(
-    type="OneCycleLR", 
+    type="OneCycleLR",
     max_lr=[0.006, 0.0006],
     pct_start=0.1,
     anneal_strategy="cos",
     div_factor=10.0,
-    final_div_factor=1000.0
+    final_div_factor=1000.0,
 )
+
 param_dicts = [dict(keyword="block", lr=0.0006)]
 
 dataset_type = "AeroRelief3DDataset"
@@ -67,7 +74,7 @@ data = dict(
     ignore_index=-1,
     names=names,
     train=dict(
-        type=dataset_type, 
+        type=dataset_type,
         split=("Area_1", "Area_3", "Area_4", "Area_5", "Area_6", "Area_7", "Area_8"),
         data_root=data_root,
         transform=[
@@ -88,9 +95,9 @@ data = dict(
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
-            dict(type="Collect", 
-                 keys=("coord", "grid_coord", "segment"), 
-                 feat_keys=("coord", "color")),
+            dict(type="Collect",
+                 keys=("coord", "grid_coord", "segment"),
+                 feat_keys=("color", "coord")),
         ],
         test_mode=False,
     ),
@@ -101,13 +108,13 @@ data = dict(
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),
-            dict(type="GridSample", grid_size=grid_size, hash_type="fnv", mode="train", return_grid_coord=True, return_inverse=True),
+            dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="train", return_grid_coord=True, return_inverse=True),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
-            dict(type="Collect", 
-                 keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"), 
-                 feat_keys=("coord", "color")),
+            dict(type="Collect",
+                 keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
+                 feat_keys=("color", "coord")),
         ],
         test_mode=False,
     ),
@@ -118,19 +125,41 @@ data = dict(
         transform=[dict(type="CenterShift", apply_z=True), dict(type="NormalizeColor")],
         test_mode=True,
         test_cfg=dict(
-            voxelize=dict(type="GridSample", grid_size=grid_size, hash_type="fnv", mode="test", return_grid_coord=True),
+            voxelize=dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="test", return_grid_coord=True),
             crop=None,
             post_transform=[
                 dict(type="CenterShift", apply_z=False),
                 dict(type="ToTensor"),
-                dict(type="Collect", 
-                     keys=("coord", "grid_coord", "index"), 
-                     feat_keys=("coord", "color")),
+                dict(type="Collect",
+                     keys=("coord", "grid_coord", "index"),
+                     feat_keys=("color", "coord")),
             ],
-            aug_transform=[
+               aug_transform=[
                 [dict(type="RandomScale", scale=[0.9, 0.9])],
-                [dict(type="RandomScale", scale=[1.0, 1.0])],
+                [dict(type="RandomScale", scale=[0.95, 0.95])],
+                [dict(type="RandomScale", scale=[1, 1])],
+                [dict(type="RandomScale", scale=[1.05, 1.05])],
                 [dict(type="RandomScale", scale=[1.1, 1.1])],
+                [
+                    dict(type="RandomScale", scale=[0.9, 0.9]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[0.95, 0.95]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[1, 1]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[1.05, 1.05]),
+                    dict(type="RandomFlip", p=1),
+                ],
+                [
+                    dict(type="RandomScale", scale=[1.1, 1.1]),
+                    dict(type="RandomFlip", p=1),
+                ],
             ],
         ),
     ),

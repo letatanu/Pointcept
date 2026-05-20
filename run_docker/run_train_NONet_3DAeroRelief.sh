@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="0,1,2,3"
+DEVICES="all"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -13,8 +13,8 @@ DOCKER_IMAGE="letatanu/poincept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="aerorelief3d"
-EXP_NAME="PT-v3m1-NO_01"
-CONFIG_PATH="semseg-pt-v3-no-base"
+EXP_NAME="semseg-pt-v3-no-v2_01"
+CONFIG_PATH="semseg-pt-v3-no-v2"
 
 ## --------------------------------------------------------- ##
 DATASET="aerorelief3d"
@@ -26,7 +26,6 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
   -v /media/volume/data/project/semantic_3d/Pointcept/:/working \
-  -v /media/volume/data/project/semantic_3d/data/:/working/data \
   -e OMP_NUM_THREADS=${OMP_NUM_THREADS} \
   "${DOCKER_IMAGE}"  bash -lc "
   sh scripts/train.sh \

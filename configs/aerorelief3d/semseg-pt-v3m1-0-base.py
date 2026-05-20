@@ -70,7 +70,7 @@ param_dicts = [dict(keyword="block", lr=0.00006)]
 
 # dataset settings
 dataset_type = "AeroRelief3DDataset"
-data_root = "data/AeroRelief3D/pointcept"
+data_root = "data/aerorelief3d/pointcept"
 
 data = dict(
     num_classes=len(names),
