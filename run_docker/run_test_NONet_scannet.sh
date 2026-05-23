@@ -11,13 +11,13 @@ OMP_NUM_THREADS=4
 DOCKER_IMAGE="letatanu/poincept1"
 
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
-EXP_NAME="semseg-pt-v3-no-v2_02"
+EXP_NAME="semseg-pt-v3-no-v2_01"
 ## --------------------------------------------------------- ##
-DATASET="s3dis"
+DATASET="scannet"
 echo "Model Name: $MODEL_NAME"
 echo "Devices: $DEVICES"
 
-docker run --ulimit nofile=1048576:1048576 --shm-size=32g \
+docker run --ulimit nofile=1048576:1048576 --ipc=host \
   --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \

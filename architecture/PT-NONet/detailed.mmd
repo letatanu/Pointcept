@@ -1,0 +1,39 @@
+flowchart TD
+    In[Point Features & Coords] --> Split{Parallel Paths}
+    
+    %% Local Path
+    Split --> LocalPath[Local PTv3 Path<br>Serialized Pooling / Unpooling]
+    
+    %% Global Path (Shared NO)
+    Split --> NOBranch
+    
+    subgraph NOBranch [Shared NOGlobalBranch]
+        direction TB
+        P2G[Scatter Points to Voxel Grid<br>64x64x64xC]
+        Bottleneck[Channel Bottleneck<br>Conv3d to max 64 ch]
+        subgraph Fourier [Fourier Layer]
+            %% direction TB
+            %% FFT[Fast Fourier Transform]
+            %% Mult[Complex Multiply with Spectral Weights]
+            %% IFFT[Inverse Fast Fourier Transform]
+            %% FFT --> Mult --> IFFT
+        end
+            
+        ReverseBN[Reverse Bottleneck<br>Conv3d to Original ch]
+        G2P[Gather Grid back to Points]
+        Norm[LayerNorm]
+
+        P2G --> Bottleneck --> Fourier --> ReverseBN --> G2P --> Norm
+    end
+    
+    %% Fusion
+    LocalPath --> Fusion
+    NOBranch --> Proj[Local Projection Head<br>Linear]
+    Proj --> Gate[Learnable Gate<br>Sigmoid]
+    Gate --> Fusion((+ or Concat))
+    
+    Fusion --> Out[Fused Point Features]
+
+    style NOBranch fill:#e8f8f5,stroke:#2980b9,stroke-width:2px
+    style Fourier fill:#fcf3cf,stroke:#f39c12,stroke-width:2px
+    style LocalPath fill:#eaeded,stroke:#d35400,stroke-width:2px

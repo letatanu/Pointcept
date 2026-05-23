@@ -65,7 +65,7 @@ scheduler = dict(
 param_dicts = [dict(keyword="block", lr=0.0006)]
 
 dataset_type = "S3DISDataset"
-data_root = "data/S3DIS/pointcept"
+data_root = "data/s3dis"
 
 data = dict(
     num_classes=13, ignore_index=-1,

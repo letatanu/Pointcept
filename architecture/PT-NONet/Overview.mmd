@@ -1,0 +1,66 @@
+flowchart TB
+    Input((Input Points)) --> Embed[Point Embedding]
+    %% Shared NO Registry
+    subgraph Registry [Shared NOGlobalBranch]
+        direction LR
+        NO64{{Shared NO Branch<br>Ch: 64}}
+        NO128{{Shared NO Branch<br>Ch: 128}}
+        NO256{{Shared NO Branch<br>Ch: 256}}
+        NO64 ~~~ NO128
+        NO128 ~~~ NO256
+    end
+
+    %% Sharing Connections
+    pool1 --> NO64
+    NO64 --> unpool1 
+
+    pool2 --> NO128
+    NO128 --> unpool2 
+
+    pool3 --> NO256
+    NO256 --> unpool3 
+
+    subgraph Backbone [PT-NOE Encoder-Decoder Backbone]
+        direction TB
+        subgraph Encoder [Encoder Path]
+            direction TB
+            E1[Stage 1: PTv3 Blocks]
+            pool1[NO Fused Pooling<br>Output: 64 ch]
+            E2[Stage 2: PTv3 Blocks]
+            pool2[NO Fused Pooling<br>Output: 128 ch]
+            E3[Stage 3: PTv3 Blocks]
+            pool3[NO Fused Pooling<br>Output: 256 ch]
+            E4[Stage 4: PTv3 Blocks]
+
+            E1 --> pool1 --> E2 --> pool2 --> E3 --> pool3 --> E4
+        end
+
+        subgraph Decoder [Decoder Path]
+            direction TB
+            unpool3[NO Fused Unpooling<br>Input: 256 ch]
+            D3[Stage 3: PTv3 Blocks]
+            unpool2[NO Fused Unpooling<br>Input: 128 ch]
+            D2[Stage 2: PTv3 Blocks]
+            unpool1[NO Fused Unpooling<br>Input: 64 ch]
+            D1[Stage 1: PTv3 Blocks]
+
+            unpool3 --> D3 --> unpool2 --> D2 --> unpool1 --> D1
+        end
+    end
+
+    Embed --> Backbone
+    E4 --> unpool3
+    
+    %% Skip Connections
+    E3 -. "Skip Features" .-> unpool3
+    E2 -. "Skip Features" .-> unpool2
+    E1 -. "Skip Features" .-> unpool1
+    
+    Backbone --> Output((Segmentation Output))
+
+    style Registry fill:#f9f2f4,stroke:#333,stroke-width:2px
+    style NO64 fill:#d4e6f1,stroke:#8e44ad,stroke-width:2px
+    style NO128 fill:#d4e6f1,stroke:#8e44ad,stroke-width:2px
+    style NO256 fill:#d4e6f1,stroke:#8e44ad,stroke-width:2px
+
+    
