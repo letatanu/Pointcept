@@ -13,8 +13,8 @@ DOCKER_IMAGE="letatanu/poincept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="PT-v3m1-NO-SharedBranch"
-EXP_NAME="semseg-pt-v3-no-v2_02"
-CONFIG_PATH="semseg-pt-v3-no-v2"
+EXP_NAME="semseg-pt-v3-no-v2_03"
+CONFIG_PATH="semseg-pt-v3-no-v2-1"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
 echo "Model Name: $MODEL_NAME"
