@@ -2,7 +2,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 52
+batch_size = 48
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -47,6 +47,7 @@ model = dict(
         share_no_branch=True,
         universal_dim=64,
         pool_reduce="max",
+        NO_type="WNO",  # Using WNO in this version for stronger global modeling
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),

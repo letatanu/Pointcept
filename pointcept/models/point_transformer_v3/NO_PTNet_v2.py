@@ -19,6 +19,8 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
 )
 
 
+
+
 # ---------------------------------------------------------------------------
 # GridPooling  (from Sonata / PT-v3m2)
 # ---------------------------------------------------------------------------
@@ -196,6 +198,76 @@ class RelativePositionEncoding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# WNO3dBlock (Wavelet Neural Operator Block)
+# Replaces FNO3dBlock — Drop-in replacement, fully AMP safe
+# ---------------------------------------------------------------------------
+
+class WNO3dBlock(nn.Module):
+    def __init__(self, channels: int, levels: int = 3):
+        """
+        levels: Number of wavelet decomposition levels. 
+                For a 64x64x64 grid, 3 levels decomposes down to an 8x8x8 
+                global context grid, mimicking the lowest Fourier modes.
+        """
+        super().__init__()
+        self.levels = levels
+        
+        self.decomps = nn.ModuleList()
+        self.recons = nn.ModuleList()
+        self.mixers = nn.ModuleList()
+
+        # Learnable Wavelet Basis (Depthwise Convolutions)
+        for _ in range(levels):
+            # Analysis: Extract low/high frequency coefficients (like DWT)
+            self.decomps.append(
+                nn.Conv3d(channels, channels, kernel_size=2, stride=2, groups=channels)
+            )
+            # Synthesis: Reconstruct spatial signal (like Inverse DWT)
+            self.recons.append(
+                nn.ConvTranspose3d(channels, channels, kernel_size=2, stride=2, groups=channels)
+            )
+            # Operator: Mix wavelet coefficients across channels
+            self.mixers.append(
+                nn.Conv3d(channels, channels, kernel_size=1)
+            )
+
+        # Base operator for the deepest global context
+        self.global_mix = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        
+        # Spatial bypass connection
+        self.bypass = nn.Conv3d(channels, channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, C, Gx, Gy, Gz)
+        x_bypass = self.bypass(x)
+
+        # ---------------------------------------------------------
+        # 1. Multi-scale Wavelet Decomposition (Analysis)
+        # ---------------------------------------------------------
+        coeffs = []
+        curr_x = x
+        for i in range(self.levels):
+            curr_x = self.decomps[i](curr_x)
+            coeffs.append(curr_x)
+
+        # ---------------------------------------------------------
+        # 2. Global Context Mixing (Lowest Frequency Band)
+        # ---------------------------------------------------------
+        curr_x = self.global_mix(curr_x)
+
+        # ---------------------------------------------------------
+        # 3. Wavelet Reconstruction (Synthesis)
+        # ---------------------------------------------------------
+        for i in reversed(range(self.levels)):
+            # Mix the coefficients at this scale
+            mixed_coeff = self.mixers[i](coeffs[i])
+            # Add wavelet detail and upsample
+            curr_x = curr_x + mixed_coeff
+            curr_x = self.recons[i](curr_x)
+
+        return curr_x + x_bypass
+
+# ---------------------------------------------------------------------------
 # FNO3dBlock  (AMP-safe, no internal bottleneck — universal dim is fixed)
 # ---------------------------------------------------------------------------
 
@@ -256,9 +328,13 @@ class NOGlobalBranch(nn.Module):
         modes: int = 8,
         grid_size: tuple = (64, 64, 64),
         norm_layer=nn.LayerNorm,
+        NO_type: str = "FNO",
     ):
         super().__init__()
-        self.fno       = FNO3dBlock(channels, modes)
+        if NO_type == "FNO":
+            self.no = FNO3dBlock(channels, modes)
+        else:
+            self.no = WNO3dBlock(channels, levels=3)  # Using 3-level WNO as default alternative
         self.norm      = norm_layer(channels)
         self.grid_size = grid_size
         # Relative position encoding → fused into features before FFT
@@ -304,7 +380,7 @@ class NOGlobalBranch(nn.Module):
 
         # --- 3. FNO3dBlock on dense grid ---
         grid     = grid_flat.view(1, Gx, Gy, Gz, C).permute(0, 4, 1, 2, 3).contiguous()
-        grid_out = self.fno(grid)                     # (1, C, Gx, Gy, Gz)
+        grid_out = self.no(grid)                     # (1, C, Gx, Gy, Gz)
 
         # --- 4. Gather back to points ---
         feat_out = grid_out.squeeze(0).permute(1, 2, 3, 0).reshape(-1, C)[flat_idx]
@@ -501,13 +577,14 @@ class PointTransformerV3_NO(PointModule):
         upcast_softmax: bool = False,
         # ---- NO parameters ----
         no_stages=(True, True, True, True),
-        fno_modes: int = 8,
-        base_grid_size: tuple = (64, 64, 64),
+        fno_modes: int = 16,
+        base_grid_size: tuple = (128, 128, 128),
         use_skip: bool = True,
         fusion: str = "concat",
         learnable_stage_weights: bool = True,
         share_no_branch: bool = True,
-        universal_dim: int = 64,
+        universal_dim: int = 128,
+        NO_type: str = "FNO",
         # ---- GridPooling parameters ----
         pool_reduce: str = "max",
     ):
@@ -532,6 +609,7 @@ class PointTransformerV3_NO(PointModule):
                 modes=fno_modes,
                 grid_size=base_grid_size,
                 norm_layer=ln_layer,
+                NO_type=NO_type
             )
         else:
             self.universal_no_branch = None
