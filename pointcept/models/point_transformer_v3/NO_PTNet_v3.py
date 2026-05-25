@@ -18,9 +18,88 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
     Block, Embedding,
 )
 
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    raise ImportError("Please install the official mamba-ssm package: pip install mamba-ssm")
 
+class MambaBlock(nn.Module):
+    """
+    Grid-Free Point Sequence Operator Block.
+    Serializes irregular point clouds into 1D sequences via stable lexicographical 
+    sorting, processes them using Bidirectional Mamba blocks, and remaps them back.
+    """
+    def __init__(self, channels: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+        super().__init__()
+        if Mamba is None:
+            raise ImportError("Please install the official mamba-ssm package to use MambaBlock.")
+            
+        # Forward and Backward state-space models for bidirectional sequence scanning
+        self.mamba_forward = Mamba(
+            d_model=channels,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
+        self.mamba_backward = Mamba(
+            d_model=channels,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
+        self.direction_fusion = nn.Linear(channels * 2, channels)
 
-
+    def forward(self, feat: torch.Tensor, coord: torch.Tensor, offset: torch.Tensor = None) -> torch.Tensor:
+        """
+        Args:
+            feat   : (N, C) point features (e.g., universal_dim channels)
+            coord  : (N, 3) spatial coordinates
+            offset : (B,) optional Pointcept cumulative batch point counts
+        Returns:
+            (N, C) sequence-coordinated global features
+        """
+        device = feat.device
+        # Fallback to a single batch item if no offset tensor is passed
+        if offset is None:
+            offset = torch.tensor([feat.shape[0]], device=device, dtype=torch.long)
+            
+        num_batches = offset.shape[0]
+        output_feats = torch.zeros_like(feat)
+        
+        start_idx = 0
+        for b in range(num_batches):
+            end_idx = offset[b].item()
+            if start_idx == end_idx:
+                continue
+                
+            b_feat = feat[start_idx:end_idx]   
+            b_coord = coord[start_idx:end_idx] 
+            
+            # 1. Coordinate Serialization via Stable Lexicographical Sorting (Z -> Y -> X)
+            sort_idx = torch.arange(b_feat.shape[0], device=device)
+            for axis in [2, 1, 0]: 
+                sort_idx = sort_idx[torch.argsort(b_coord[sort_idx, axis], stable=True)]
+            inverse_idx = torch.argsort(sort_idx)
+            
+            # 2. Format to Mamba expected sequence shape: (Batch=1, Length, Channels)
+            seq_feat = b_feat[sort_idx].unsqueeze(0) 
+            
+            # 3. Bidirectional context processing
+            feat_fwd = self.mamba_forward(seq_feat)
+            
+            seq_feat_bwd = torch.flip(seq_feat, dims=[1])
+            feat_bwd = self.mamba_backward(seq_feat_bwd)
+            feat_bwd = torch.flip(feat_bwd, dims=[1])
+            
+            # 4. Concatenate directional tracks and project down
+            fused_seq = torch.cat([feat_fwd, feat_bwd], dim=-1).squeeze(0) 
+            fused_b_feat = self.direction_fusion(fused_seq)                          
+            
+            # 5. Invert sorting permutation map back to unstructured arrangement
+            output_feats[start_idx:end_idx] = fused_b_feat[inverse_idx]
+            start_idx = end_idx
+            
+        return output_feats
 # ---------------------------------------------------------------------------
 # GridPooling  (from Sonata / PT-v3m2)
 # ---------------------------------------------------------------------------
@@ -499,7 +578,7 @@ class NOGlobalBranch(nn.Module):
     Each calling layer is responsible for projecting its own features to/from
     this fixed dimension.
 
-    NEW: relative position encoding is fused into the feature before gridding.
+    Relative position encoding is fused into the feature before processing.
     """
     def __init__(
         self,
@@ -508,68 +587,99 @@ class NOGlobalBranch(nn.Module):
         grid_size: tuple = (64, 64, 64),
         norm_layer=nn.LayerNorm,
         NO_type: str = "FNO",
+
+        # Mamba-specific hyperparameters passed down to MambaBlock
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
     ):
         super().__init__()
+        self.NO_type = NO_type  
+        self.grid_size = grid_size
+        self.channels = channels
+        
+        # Dispatch Blocks Uniformly
         if NO_type == "FNO":
             self.no = FNO3dBlock(channels, modes)
         elif NO_type == "WNO":
-            self.no = WNO3dBlock(channels, levels=3)  # Using 3-level WNO as default alternative
+            self.no = WNO3dBlock(channels, levels=3)  
         elif NO_type == "MLP":
             self.no = MLP3dBlock(channels)
         elif NO_type == "CNN":
             self.no = CNN3dBlock(channels)
-        self.norm      = norm_layer(channels)
-        self.grid_size = grid_size
-        # Relative position encoding → fused into features before FFT
+        elif NO_type == "Mamba":
+            self.no = MambaBlock(
+                channels=channels, 
+                d_state=d_state, 
+                d_conv=d_conv, 
+                expand=expand
+            )
+        
+        self.norm = norm_layer(channels)
+        # Relative position encoding → fused into features before any block execution
         self.rel_pos_enc = RelativePositionEncoding(channels)
 
-    def forward(self, feat: torch.Tensor, coord: torch.Tensor) -> torch.Tensor:
+    def forward(self, feat: torch.Tensor, coord: torch.Tensor, offset: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
-            feat  : (N, C) — already projected to universal_dim by the caller
-            coord : (N, 3) — grid_coord or coord of the current stage
+            feat   : (N, C) — already projected to universal_dim by the caller
+            coord  : (N, 3) — grid_coord or coord of the current stage
+            offset : (B,)   — optional Pointcept batch displacement tracking array
         Returns:
-            (N, C) — spectral-enriched features, same shape as input
+            (N, C) — globally enriched features, same shape as input
         """
-        Gx, Gy, Gz  = self.grid_size
-        C            = feat.shape[1]
+        C = feat.shape[1]
         device, dtype = feat.device, feat.dtype
 
-        # --- 1. Fuse relative position encoding into features ---
+        # --- 1. Fuse relative position encoding into features (Common to all paths) ---
         pos_enc = self.rel_pos_enc(coord).to(dtype)   # (N, C)
-        feat    = feat + pos_enc                       # in-place add, keeps grad
+        feat = feat + pos_enc                         # in-place add, keeps grad
 
-        # --- 2. Scatter points onto a dense regular grid ---
-        coord_f   = coord.float()
-        coord_min = coord_f.min(dim=0).values
-        coord_max = coord_f.max(dim=0).values
-        scale     = (coord_max - coord_min).clamp(min=1.0)
-        G_max     = torch.tensor(
-            [Gx - 1, Gy - 1, Gz - 1], device=device, dtype=torch.float32
-        )
-        shifted  = ((coord_f - coord_min) / scale * G_max).long()
-        shifted  = shifted.clamp(
-            min=torch.zeros(3, device=device, dtype=torch.long),
-            max=G_max.long(),
-        )
-        flat_idx  = shifted[:, 0] * (Gy * Gz) + shifted[:, 1] * Gz + shifted[:, 2]
+        # =========================================================================
+        # PARADIGM A: GRID-FREE SEQUENTIAL PATH
+        # =========================================================================
+        if self.NO_type == "Mamba":
+            # Pass directly to our standalone MambaBlock
+            feat_out = self.no(feat, coord, offset)
+            return self.norm(feat_out)
 
-        grid_flat = torch.zeros(Gx * Gy * Gz, C, device=device, dtype=dtype)
-        count     = torch.zeros(Gx * Gy * Gz, 1, device=device, dtype=dtype)
-        grid_flat.scatter_add_(0, flat_idx.unsqueeze(1).expand(-1, C), feat)
-        count.scatter_add_(0, flat_idx.unsqueeze(1),
-                           torch.ones(feat.shape[0], 1, device=device, dtype=dtype))
-        grid_flat = grid_flat / count.clamp(min=1.0)
+        # =========================================================================
+        # PARADIGM B: TRADITIONAL DENSE 3D GRID PROCESSING PATH (FNO, WNO, CNN, MLP)
+        # =========================================================================
+        else:
+            Gx, Gy, Gz = self.grid_size
+            
+            # --- 2. Scatter points onto a dense regular grid ---
+            coord_f = coord.float()
+            coord_min = coord_f.min(dim=0).values
+            coord_max = coord_f.max(dim=0).values
+            scale = (coord_max - coord_min).clamp(min=1.0)
+            G_max = torch.tensor(
+                [Gx - 1, Gy - 1, Gz - 1], device=device, dtype=torch.float32
+            )
+            shifted = ((coord_f - coord_min) / scale * G_max).long()
+            shifted = shifted.clamp(
+                min=torch.zeros(3, device=device, dtype=torch.long),
+                max=G_max.long(),
+            )
+            flat_idx = shifted[:, 0] * (Gy * Gz) + shifted[:, 1] * Gz + shifted[:, 2]
 
-        # --- 3. FNO3dBlock on dense grid ---
-        grid     = grid_flat.view(1, Gx, Gy, Gz, C).permute(0, 4, 1, 2, 3).contiguous()
-        grid_out = self.no(grid)                     # (1, C, Gx, Gy, Gz)
+            grid_flat = torch.zeros(Gx * Gy * Gz, C, device=device, dtype=dtype)
+            count = torch.zeros(Gx * Gy * Gz, 1, device=device, dtype=dtype)
+            grid_flat.scatter_add_(0, flat_idx.unsqueeze(1).expand(-1, C), feat)
+            count.scatter_add_(0, flat_idx.unsqueeze(1),
+                               torch.ones(feat.shape[0], 1, device=device, dtype=dtype))
+            grid_flat = grid_flat / count.clamp(min=1.0)
 
-        # --- 4. Gather back to points ---
-        feat_out = grid_out.squeeze(0).permute(1, 2, 3, 0).reshape(-1, C)[flat_idx]
-        del grid_flat, count, grid, grid_out
+            # --- 3. Run selected dense grid operator ---
+            grid = grid_flat.view(1, Gx, Gy, Gz, C).permute(0, 4, 1, 2, 3).contiguous()
+            grid_out = self.no(grid)                     # (1, C, Gx, Gy, Gz)
 
-        return self.norm(feat_out)
+            # --- 4. Gather back to points ---
+            feat_out = grid_out.squeeze(0).permute(1, 2, 3, 0).reshape(-1, C)[flat_idx]
+            del grid_flat, count, grid, grid_out
+
+            return self.norm(feat_out)
 
 
 # ---------------------------------------------------------------------------
