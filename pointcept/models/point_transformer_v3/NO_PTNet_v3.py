@@ -18,10 +18,9 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
     Block, Embedding,
 )
 
-try:
-    from mamba_ssm import Mamba
-except ImportError:
-    raise ImportError("Please install the official mamba-ssm package: pip install mamba-ssm")
+
+from mamba_ssm import Mamba
+
 
 class MambaBlock(nn.Module):
     """
