@@ -1,67 +1,13 @@
+# configs/s3dis/semseg-pt-v3m1-no-encoder-enhanced.py
+
 _base_ = ["../_base_/default_runtime.py"]
 
-# misc custom setting
-batch_size = 8  # bs: total bs in all gpus
+batch_size = 20
+num_worker = 24
 mix_prob = 0.8
 empty_cache = False
+empty_cache_per_epoch = True
 enable_amp = True
-
-# model settings
-model = dict(
-    type="DefaultSegmentor",
-    backbone=dict(
-        type="PT-v2m2",
-        in_channels=4,
-        num_classes=19,
-        patch_embed_depth=1,
-        patch_embed_channels=48,
-        patch_embed_groups=6,
-        patch_embed_neighbours=8,
-        enc_depths=(2, 2, 6, 2),
-        enc_channels=(96, 192, 384, 512),
-        enc_groups=(12, 24, 48, 64),
-        enc_neighbours=(16, 16, 16, 16),
-        dec_depths=(1, 1, 1, 1),
-        dec_channels=(48, 96, 192, 384),
-        dec_groups=(6, 12, 24, 48),
-        dec_neighbours=(16, 16, 16, 16),
-        grid_sizes=(0.15, 0.375, 0.9375, 2.34375),  # x3, x2.5, x2.5, x2.5
-        attn_qkv_bias=True,
-        pe_multiplier=False,
-        pe_bias=True,
-        attn_drop_rate=0.0,
-        drop_path_rate=0.3,
-        enable_checkpoint=False,
-        unpool_backend="map",  # map / interp
-    ),
-    # fmt: off
-    criteria=[
-        dict(type="CrossEntropyLoss",
-             weight=[3.1557, 8.7029, 7.8281, 6.1354, 6.3161, 7.9937, 8.9704, 10.1922, 1.6155, 4.2187,
-                     1.9385, 5.5455, 2.0198, 2.6261, 1.3212, 5.1102, 2.5492, 5.8585, 7.3929],
-             loss_weight=1.0,
-             ignore_index=-1),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
-    ],
-    # fmt: on
-)
-
-# scheduler settings
-epoch = 50
-eval_epoch = 50
-optimizer = dict(type="AdamW", lr=0.002, weight_decay=0.005)
-scheduler = dict(
-    type="OneCycleLR",
-    max_lr=optimizer["lr"],
-    pct_start=0.04,
-    anneal_strategy="cos",
-    div_factor=10.0,
-    final_div_factor=100.0,
-)
-
-# dataset settings
-dataset_type = "SemanticKITTIDataset"
-data_root = "data/semantic_kitti"
 ignore_index = -1
 names = [
     "car",
@@ -85,11 +31,79 @@ names = [
     "traffic-sign",
 ]
 
+model = dict(
+    type='DefaultSegmentorV2',
+    num_classes=len(names),
+    backbone_out_channels=64,
+    backbone=dict(
+        type="PT-v3m1-NO-SharedBranch",
+        in_channels=6,
+        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+        stride=(2, 2, 2, 2),
+
+        enc_depths=(4, 4, 2, 6, 2),
+        enc_channels=(32, 64, 128, 256, 512),
+        enc_num_head=(2, 4, 8, 16, 32),
+        enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+
+        dec_depths=(2, 2, 2, 2),
+        dec_channels=(64, 64, 128, 256),
+        dec_num_head=(4, 4, 8, 16),
+        dec_patch_size=(1024, 1024, 1024, 1024),
+
+        mlp_ratio=4,
+        drop_path=0.2,
+        pre_norm=True,
+        shuffle_orders=True,
+        enable_flash=True,
+        upcast_attention=False,
+        upcast_softmax=False,
+
+        # ---- NO / grid branch ----
+        no_stages=(True, True, True, True),
+        fno_modes=8,
+        base_grid_size=(64, 64, 64),
+        use_skip=True,
+        fusion="concat",
+        learnable_stage_weights=True,
+        share_no_branch=True,
+        universal_dim=64,
+        pool_reduce="max",
+        NO_type="MLP",  # Using MLP in this version for faster processing
+    ),
+ criteria=[
+        dict(type="CrossEntropyLoss",
+             weight=[3.1557, 8.7029, 7.8281, 6.1354, 6.3161, 7.9937, 8.9704, 10.1922, 1.6155, 4.2187,
+                     1.9385, 5.5455, 2.0198, 2.6261, 1.3212, 5.1102, 2.5492, 5.8585, 7.3929],
+             loss_weight=1.0,
+             ignore_index=-1),
+        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
+    ],
+)
+
+epoch = 50
+eval_epoch = 50
+
+optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
+scheduler = dict(
+    type="OneCycleLR",
+    max_lr=[0.006, 0.0006],
+    pct_start=0.1,
+    anneal_strategy="cos",
+    div_factor=10.0,
+    final_div_factor=1000.0,
+)
+
+param_dicts = [dict(keyword="block", lr=0.0006)]
+
+dataset_type = "SemanticKITTIDataset"
+data_root = "data/semantic_kitti"
+
 data = dict(
-    num_classes=19,
-    ignore_index=ignore_index,
+    num_classes=len(names), 
+    ignore_index=-1,
     names=names,
-    train=dict(
+   train=dict(
         type=dataset_type,
         split="train",
         data_root=data_root,

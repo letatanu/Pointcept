@@ -11,13 +11,16 @@ OMP_NUM_THREADS=4
 DOCKER_IMAGE="letatanu/pointcept1"
 
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
+
+MODEL_NAME="PT-v3m1-NO-SharedBranch"
 EXP_NAME="semseg-pt-v3-no-v2_05"
+CONFIG_PATH="semseg-pt-v3-no-v2-0"
 ## --------------------------------------------------------- ##
-DATASET="s3dis"
+DATASET="semantic_kitti"
 echo "Model Name: $MODEL_NAME"
 echo "Devices: $DEVICES"
 
-docker run --ulimit nofile=1048576:1048576 --shm-size=32g \
+docker run --ulimit nofile=1048576:1048576 --ipc=host \
   --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
@@ -25,4 +28,8 @@ docker run --ulimit nofile=1048576:1048576 --shm-size=32g \
   -e OMP_NUM_THREADS=${OMP_NUM_THREADS} \
   "${DOCKER_IMAGE}"    \
   bash -lc "
-    sh scripts/test.sh -p python -d ${DATASET} -n ${EXP_NAME} -w model_best"
+    sh scripts/train.sh \
+      -p python \
+      -d ${DATASET} \
+      -c ${CONFIG_PATH} \
+      -n ${EXP_NAME}"

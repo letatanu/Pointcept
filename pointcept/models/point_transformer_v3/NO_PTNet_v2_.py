@@ -198,6 +198,139 @@ class RelativePositionEncoding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# HybridNeuralOperatorBlock (Factorized FNO + Local CNN)
+# The ultimate operator for 3D Point Clouds
+# ---------------------------------------------------------------------------
+
+class HybridNeuralOperatorBlock(nn.Module):
+    def __init__(self, channels: int, modes: int = 8):
+        super().__init__()
+        self.modes = modes
+        
+        # ---------------------------------------------------------
+        # 1. Global Spectral Path: Factorized 3D FNO
+        # ---------------------------------------------------------
+        scale = 1.0 / (channels * channels)
+        
+        # X-axis frequencies
+        self.w_x_real = nn.Parameter(scale * torch.rand(channels, channels, modes))
+        self.w_x_imag = nn.Parameter(scale * torch.rand(channels, channels, modes))
+        # Y-axis frequencies
+        self.w_y_real = nn.Parameter(scale * torch.rand(channels, channels, modes))
+        self.w_y_imag = nn.Parameter(scale * torch.rand(channels, channels, modes))
+        # Z-axis frequencies
+        self.w_z_real = nn.Parameter(scale * torch.rand(channels, channels, modes))
+        self.w_z_imag = nn.Parameter(scale * torch.rand(channels, channels, modes))
+
+        # ---------------------------------------------------------
+        # 2. Local Spatial Path: 3x3x3 CNN
+        # ---------------------------------------------------------
+        self.local_cnn = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels), # Depthwise
+            nn.BatchNorm3d(channels),
+            nn.GELU(),
+            nn.Conv3d(channels, channels, kernel_size=1) # Pointwise mix
+        )
+        
+        # Spatial bypass connection
+        self.bypass = nn.Conv3d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, C, Gx, Gy, Gz)
+        x_bypass = self.bypass(x)
+        
+        # =========================================================
+        # PATH A: Factorized Global Spectral Extraction
+        # =========================================================
+        orig_dtype = x.dtype
+        x_fp32 = x.to(torch.float32)
+
+        # 3D FFT
+        x_ft = torch.fft.rfftn(x_fp32, dim=[-3, -2, -1])
+        out_ft = torch.zeros_like(x_ft)
+
+        mx = min(self.modes, x_ft.shape[2])
+        my = min(self.modes, x_ft.shape[3])
+        mz = min(self.modes, x_ft.shape[4])
+
+        # Form complex weights
+        wx = torch.complex(self.w_x_real, self.w_x_imag)
+        wy = torch.complex(self.w_y_real, self.w_y_imag)
+        wz = torch.complex(self.w_z_real, self.w_z_imag)
+
+        # Factorized Einstein Summations
+        # Instead of a full 3D dense matrix, we project each dimension independently
+        # and sum the spectral responses. This isolates geometric axes perfectly.
+        out_x = torch.einsum("bcxyz,cdx->bdxyz", x_ft[:, :, :mx, :my, :mz], wx[:, :, :mx])
+        out_y = torch.einsum("bcxyz,cdy->bdxyz", x_ft[:, :, :mx, :my, :mz], wy[:, :, :my])
+        out_z = torch.einsum("bcxyz,cdz->bdxyz", x_ft[:, :, :mx, :my, :mz], wz[:, :, :mz])
+        
+        out_ft[:, :, :mx, :my, :mz] = out_x + out_y + out_z
+
+        # Inverse FFT
+        x_global = torch.fft.irfftn(out_ft, s=x.shape[-3:], dim=[-3, -2, -1])
+        x_global = x_global.to(orig_dtype)
+        
+        # =========================================================
+        # PATH B: Local Spatial Extraction
+        # =========================================================
+        x_local = self.local_cnn(x)
+
+        # =========================================================
+        # FUSE: High-Frequency Local + Low-Frequency Global + Bypass
+        # =========================================================
+        return x_global + x_local + x_bypass
+
+# ---------------------------------------------------------------------------
+# CNN3dBlock (Spatial Convolution + Global Context)
+# Replaces MLP3dBlock/FNO3dBlock 
+# ---------------------------------------------------------------------------
+
+class CNN3dBlock(nn.Module):
+    def __init__(self, channels: int, expansion_ratio: float = 2.0):
+        super().__init__()
+        hidden_dim = int(channels * expansion_ratio)
+        
+        # 1. Global Context Path (Squeeze-and-Excitation style)
+        self.global_pool = nn.AdaptiveAvgPool3d(1)
+        self.global_mlp = nn.Sequential(
+            nn.Conv3d(channels, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Conv3d(hidden_dim, channels, kernel_size=1)
+        )
+        
+        # 2. Local Spatial CNN Path
+        # Uses 3x3x3 convolutions with padding=1 to maintain the exact grid size
+        self.local_cnn = nn.Sequential(
+            nn.Conv3d(channels, hidden_dim, kernel_size=3, padding=1),
+            nn.BatchNorm3d(hidden_dim),  # Spatial convs benefit greatly from BatchNorm
+            nn.GELU(),
+            nn.Conv3d(hidden_dim, channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(channels)
+        )
+        
+        # Bypass connection
+        self.bypass = nn.Conv3d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x shape: (B, C, Gx, Gy, Gz)
+        x_bypass = self.bypass(x)
+        
+        # --- Extract Global 3D Context ---
+        # Pools (B, C, Gx, Gy, Gz) -> (B, C, 1, 1, 1)
+        global_feat = self.global_pool(x)
+        global_feat = self.global_mlp(global_feat) 
+        
+        # --- Extract Local Spatial Features ---
+        local_feat = self.local_cnn(x) 
+        
+        # --- Fuse Global Context into Local Features ---
+        # The (1,1,1) global feature broadcasts naturally over the spatial grid
+        out = local_feat + global_feat 
+        
+        return out + x_bypass
+
+# ---------------------------------------------------------------------------
 # MLP3dBlock (Global-Local Context MLP)
 # Replaces WNO3dBlock/FNO3dBlock — Extremely fast, AMP safe, lowest memory
 # ---------------------------------------------------------------------------
@@ -383,6 +516,8 @@ class NOGlobalBranch(nn.Module):
             self.no = WNO3dBlock(channels, levels=3)  # Using 3-level WNO as default alternative
         elif NO_type == "MLP":
             self.no = MLP3dBlock(channels)
+        elif NO_type == "CNN":
+            self.no = CNN3dBlock(channels)
         self.norm      = norm_layer(channels)
         self.grid_size = grid_size
         # Relative position encoding → fused into features before FFT
