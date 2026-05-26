@@ -8,6 +8,8 @@ mix_prob = 0.8
 empty_cache = False
 empty_cache_per_epoch = True
 enable_amp = True
+amp_dtype = "bfloat16"
+clip_grad = 1.0
 
 model = dict(
     type="DefaultSegmentorV2",

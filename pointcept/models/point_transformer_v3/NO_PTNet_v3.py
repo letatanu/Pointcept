@@ -18,8 +18,8 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
     Block, Embedding,
 )
 
-
 from mamba_ssm import Mamba
+
 
 
 class MambaBlock(nn.Module):
@@ -99,8 +99,9 @@ class MambaBlock(nn.Module):
             start_idx = end_idx
             
         return output_feats
+
 # ---------------------------------------------------------------------------
-# GridPooling  (from Sonata / PT-v3m2)
+# GridPooling  (Fixed Two's Complement Bitwise Shift Bug)
 # ---------------------------------------------------------------------------
 
 class GridPooling(PointModule):
@@ -148,12 +149,24 @@ class GridPooling(PointModule):
                 "[grid_coord] or [coord, grid_size] should be in the Point"
             )
         grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc")
-        grid_coord = grid_coord | point.batch.view(-1, 1) << 48
+        
+        # --- FIX: Shift grid coordinates to be strictly non-negative before bitwise manipulation ---
+        coord_min = grid_coord.min(0, keepdim=True).values
+        grid_coord = grid_coord - coord_min
+        
+        grid_coord = grid_coord.long()
+        grid_coord = grid_coord | point.batch.view(-1, 1).long() << 48
         grid_coord, cluster, counts = torch.unique(
             grid_coord, sorted=True,
             return_inverse=True, return_counts=True, dim=0,
         )
         grid_coord = grid_coord & ((1 << 48) - 1)
+        
+        # Restore original coordinate space offsets safely
+        grid_coord = grid_coord + coord_min.long()
+        grid_coord = grid_coord.int()
+        # --------------------------------------------------------------------------------------------
+        
         _, indices = torch.sort(cluster)
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         head_indices = indices[idx_ptr[:-1]]
@@ -198,7 +211,7 @@ class GridPooling(PointModule):
 
 
 # ---------------------------------------------------------------------------
-# GridUnpooling  (from Sonata / PT-v3m2)
+# GridUnpooling
 # ---------------------------------------------------------------------------
 
 class GridUnpooling(PointModule):
@@ -244,17 +257,9 @@ class GridUnpooling(PointModule):
 # ---------------------------------------------------------------------------
 # RelativePositionEncoding
 # ---------------------------------------------------------------------------
-
 class RelativePositionEncoding(nn.Module):
-    """
-    Encodes normalized relative 3D coordinates into a channel vector.
-    Inputs  : coord (N, 3) — raw or grid coordinates
-    Output  : (N, out_channels)
-    Features: (dx, dy, dz, radius) relative to the per-batch centroid.
-    """
     def __init__(self, out_channels: int):
         super().__init__()
-        # 4 raw geometry features → out_channels
         self.mlp = nn.Sequential(
             nn.Linear(4, out_channels),
             nn.LayerNorm(out_channels),
@@ -263,67 +268,47 @@ class RelativePositionEncoding(nn.Module):
         )
 
     def forward(self, coord: torch.Tensor) -> torch.Tensor:
-        # coord: (N, 3) float
         coord_f   = coord.float()
-        centroid  = coord_f.mean(dim=0, keepdim=True)          # (1, 3)
-        delta     = coord_f - centroid                          # (N, 3)
-        radius    = delta.norm(dim=1, keepdim=True)             # (N, 1)
-        # normalize to [-1, 1] for each axis
+        centroid  = coord_f.mean(dim=0, keepdim=True)          
+        delta     = coord_f - centroid                          
+        
+        radius = torch.sqrt(torch.sum(delta ** 2, dim=1, keepdim=True) + 1e-12)
         scale = delta.abs().max(dim=0, keepdim=True).values.clamp(min=1e-6)
-        delta_n   = delta / scale                               # (N, 3)
-        geo_feat  = torch.cat([delta_n, radius / (radius.max() + 1e-6)], dim=1)  # (N, 4)
-        return self.mlp(geo_feat)                               # (N, out_channels)
+        delta_n   = delta / scale                               
+        geo_feat  = torch.cat([delta_n, radius / (radius.max() + 1e-6)], dim=1)  
+        return self.mlp(geo_feat)
 
 
 # ---------------------------------------------------------------------------
 # HybridNeuralOperatorBlock (Factorized FNO + Local CNN)
-# The ultimate operator for 3D Point Clouds
 # ---------------------------------------------------------------------------
 
 class HybridNeuralOperatorBlock(nn.Module):
     def __init__(self, channels: int, modes: int = 8):
         super().__init__()
         self.modes = modes
-        
-        # ---------------------------------------------------------
-        # 1. Global Spectral Path: Factorized 3D FNO
-        # ---------------------------------------------------------
         scale = 1.0 / (channels * channels)
         
-        # X-axis frequencies
         self.w_x_real = nn.Parameter(scale * torch.rand(channels, channels, modes))
         self.w_x_imag = nn.Parameter(scale * torch.rand(channels, channels, modes))
-        # Y-axis frequencies
         self.w_y_real = nn.Parameter(scale * torch.rand(channels, channels, modes))
         self.w_y_imag = nn.Parameter(scale * torch.rand(channels, channels, modes))
-        # Z-axis frequencies
         self.w_z_real = nn.Parameter(scale * torch.rand(channels, channels, modes))
         self.w_z_imag = nn.Parameter(scale * torch.rand(channels, channels, modes))
 
-        # ---------------------------------------------------------
-        # 2. Local Spatial Path: 3x3x3 CNN
-        # ---------------------------------------------------------
         self.local_cnn = nn.Sequential(
-            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels), # Depthwise
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels),
             nn.BatchNorm3d(channels),
             nn.GELU(),
-            nn.Conv3d(channels, channels, kernel_size=1) # Pointwise mix
+            nn.Conv3d(channels, channels, kernel_size=1)
         )
-        
-        # Spatial bypass connection
         self.bypass = nn.Conv3d(channels, channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C, Gx, Gy, Gz)
         x_bypass = self.bypass(x)
-        
-        # =========================================================
-        # PATH A: Factorized Global Spectral Extraction
-        # =========================================================
         orig_dtype = x.dtype
         x_fp32 = x.to(torch.float32)
 
-        # 3D FFT
         x_ft = torch.fft.rfftn(x_fp32, dim=[-3, -2, -1])
         out_ft = torch.zeros_like(x_ft)
 
@@ -331,37 +316,25 @@ class HybridNeuralOperatorBlock(nn.Module):
         my = min(self.modes, x_ft.shape[3])
         mz = min(self.modes, x_ft.shape[4])
 
-        # Form complex weights
         wx = torch.complex(self.w_x_real, self.w_x_imag)
         wy = torch.complex(self.w_y_real, self.w_y_imag)
         wz = torch.complex(self.w_z_real, self.w_z_imag)
 
-        # Factorized Einstein Summations
-        # Instead of a full 3D dense matrix, we project each dimension independently
-        # and sum the spectral responses. This isolates geometric axes perfectly.
         out_x = torch.einsum("bcxyz,cdx->bdxyz", x_ft[:, :, :mx, :my, :mz], wx[:, :, :mx])
         out_y = torch.einsum("bcxyz,cdy->bdxyz", x_ft[:, :, :mx, :my, :mz], wy[:, :, :my])
         out_z = torch.einsum("bcxyz,cdz->bdxyz", x_ft[:, :, :mx, :my, :mz], wz[:, :, :mz])
         
         out_ft[:, :, :mx, :my, :mz] = out_x + out_y + out_z
 
-        # Inverse FFT
         x_global = torch.fft.irfftn(out_ft, s=x.shape[-3:], dim=[-3, -2, -1])
         x_global = x_global.to(orig_dtype)
         
-        # =========================================================
-        # PATH B: Local Spatial Extraction
-        # =========================================================
         x_local = self.local_cnn(x)
-
-        # =========================================================
-        # FUSE: High-Frequency Local + Low-Frequency Global + Bypass
-        # =========================================================
         return x_global + x_local + x_bypass
 
+
 # ---------------------------------------------------------------------------
-# CNN3dBlock (Spatial Convolution + Global Context)
-# Replaces MLP3dBlock/FNO3dBlock 
+# CNN3dBlock 
 # ---------------------------------------------------------------------------
 
 class CNN3dBlock(nn.Module):
@@ -369,7 +342,6 @@ class CNN3dBlock(nn.Module):
         super().__init__()
         hidden_dim = int(channels * expansion_ratio)
         
-        # 1. Global Context Path (Squeeze-and-Excitation style)
         self.global_pool = nn.AdaptiveAvgPool3d(1)
         self.global_mlp = nn.Sequential(
             nn.Conv3d(channels, hidden_dim, kernel_size=1),
@@ -377,40 +349,26 @@ class CNN3dBlock(nn.Module):
             nn.Conv3d(hidden_dim, channels, kernel_size=1)
         )
         
-        # 2. Local Spatial CNN Path
-        # Uses 3x3x3 convolutions with padding=1 to maintain the exact grid size
         self.local_cnn = nn.Sequential(
             nn.Conv3d(channels, hidden_dim, kernel_size=3, padding=1),
-            nn.BatchNorm3d(hidden_dim),  # Spatial convs benefit greatly from BatchNorm
+            nn.BatchNorm3d(hidden_dim),
             nn.GELU(),
             nn.Conv3d(hidden_dim, channels, kernel_size=3, padding=1),
             nn.BatchNorm3d(channels)
         )
-        
-        # Bypass connection
         self.bypass = nn.Conv3d(channels, channels, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C, Gx, Gy, Gz)
         x_bypass = self.bypass(x)
-        
-        # --- Extract Global 3D Context ---
-        # Pools (B, C, Gx, Gy, Gz) -> (B, C, 1, 1, 1)
         global_feat = self.global_pool(x)
         global_feat = self.global_mlp(global_feat) 
-        
-        # --- Extract Local Spatial Features ---
         local_feat = self.local_cnn(x) 
-        
-        # --- Fuse Global Context into Local Features ---
-        # The (1,1,1) global feature broadcasts naturally over the spatial grid
         out = local_feat + global_feat 
-        
         return out + x_bypass
 
+
 # ---------------------------------------------------------------------------
-# MLP3dBlock (Global-Local Context MLP)
-# Replaces WNO3dBlock/FNO3dBlock — Extremely fast, AMP safe, lowest memory
+# MLP3dBlock
 # ---------------------------------------------------------------------------
 
 class MLP3dBlock(nn.Module):
@@ -418,7 +376,6 @@ class MLP3dBlock(nn.Module):
         super().__init__()
         hidden_dim = int(channels * expansion_ratio)
         
-        # 1. Global Context MLP: Extracts the macro-shape of the room
         self.global_pool = nn.AdaptiveAvgPool3d(1)
         self.global_mlp = nn.Sequential(
             nn.Conv3d(channels, hidden_dim, kernel_size=1),
@@ -426,106 +383,68 @@ class MLP3dBlock(nn.Module):
             nn.Conv3d(hidden_dim, channels, kernel_size=1)
         )
         
-        # 2. Local Channel Mixer: Pointwise feature transformation
         self.local_mlp = nn.Sequential(
             nn.Conv3d(channels, hidden_dim, kernel_size=1),
             nn.GELU(),
             nn.Conv3d(hidden_dim, channels, kernel_size=1)
         )
-        
-        # Bypass connection
         self.bypass = nn.Conv3d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C, Gx, Gy, Gz)
         x_bypass = self.bypass(x)
-        
-        # --- Extract Global 3D Context ---
-        # Pools (B, C, Gx, Gy, Gz) -> (B, C, 1, 1, 1)
         global_feat = self.global_pool(x)
         global_feat = self.global_mlp(global_feat) 
-        
-        # --- Transform Local Features ---
         local_feat = self.local_mlp(x) 
-        
-        # --- Fuse Global Context into Local Features ---
-        # The (1,1,1) global_feat broadcasts naturally over (Gx, Gy, Gz)
         out = local_feat + global_feat 
-        
         return out + x_bypass
+
 
 # ---------------------------------------------------------------------------
 # WNO3dBlock (Wavelet Neural Operator Block)
-# Replaces FNO3dBlock — Drop-in replacement, fully AMP safe
 # ---------------------------------------------------------------------------
 
 class WNO3dBlock(nn.Module):
     def __init__(self, channels: int, levels: int = 3):
-        """
-        levels: Number of wavelet decomposition levels. 
-                For a 64x64x64 grid, 3 levels decomposes down to an 8x8x8 
-                global context grid, mimicking the lowest Fourier modes.
-        """
         super().__init__()
         self.levels = levels
-        
         self.decomps = nn.ModuleList()
         self.recons = nn.ModuleList()
         self.mixers = nn.ModuleList()
 
-        # Learnable Wavelet Basis (Depthwise Convolutions)
         for _ in range(levels):
-            # Analysis: Extract low/high frequency coefficients (like DWT)
             self.decomps.append(
                 nn.Conv3d(channels, channels, kernel_size=2, stride=2, groups=channels)
             )
-            # Synthesis: Reconstruct spatial signal (like Inverse DWT)
             self.recons.append(
                 nn.ConvTranspose3d(channels, channels, kernel_size=2, stride=2, groups=channels)
             )
-            # Operator: Mix wavelet coefficients across channels
             self.mixers.append(
                 nn.Conv3d(channels, channels, kernel_size=1)
             )
 
-        # Base operator for the deepest global context
         self.global_mix = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
-        
-        # Spatial bypass connection
         self.bypass = nn.Conv3d(channels, channels, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (B, C, Gx, Gy, Gz)
         x_bypass = self.bypass(x)
-
-        # ---------------------------------------------------------
-        # 1. Multi-scale Wavelet Decomposition (Analysis)
-        # ---------------------------------------------------------
         coeffs = []
         curr_x = x
         for i in range(self.levels):
             curr_x = self.decomps[i](curr_x)
             coeffs.append(curr_x)
 
-        # ---------------------------------------------------------
-        # 2. Global Context Mixing (Lowest Frequency Band)
-        # ---------------------------------------------------------
         curr_x = self.global_mix(curr_x)
 
-        # ---------------------------------------------------------
-        # 3. Wavelet Reconstruction (Synthesis)
-        # ---------------------------------------------------------
         for i in reversed(range(self.levels)):
-            # Mix the coefficients at this scale
             mixed_coeff = self.mixers[i](coeffs[i])
-            # Add wavelet detail and upsample
             curr_x = curr_x + mixed_coeff
             curr_x = self.recons[i](curr_x)
 
         return curr_x + x_bypass
 
+
 # ---------------------------------------------------------------------------
-# FNO3dBlock  (AMP-safe, no internal bottleneck — universal dim is fixed)
+# FNO3dBlock
 # ---------------------------------------------------------------------------
 
 class FNO3dBlock(nn.Module):
@@ -568,7 +487,7 @@ class FNO3dBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# NOGlobalBranch  (Universal — fixed channels, with relative pos encoding)
+# NOGlobalBranch
 # ---------------------------------------------------------------------------
 
 class NOGlobalBranch(nn.Module):
@@ -593,29 +512,35 @@ class NOGlobalBranch(nn.Module):
         expand: int = 2,
     ):
         super().__init__()
-        self.NO_type = NO_type  
+        self.NO_type = NO_type.upper()  
         self.grid_size = grid_size
         self.channels = channels
         
-        # Dispatch Blocks Uniformly
-        if NO_type == "FNO":
+        # Dispatch Blocks Uniformly using uppercase keys
+        if self.NO_type == "FNO":
             self.no = FNO3dBlock(channels, modes)
-        elif NO_type == "WNO":
+        elif self.NO_type == "WNO":
             self.no = WNO3dBlock(channels, levels=3)  
-        elif NO_type == "MLP":
+        elif self.NO_type == "MLP":
             self.no = MLP3dBlock(channels)
-        elif NO_type == "CNN":
+        elif self.NO_type == "CNN":
             self.no = CNN3dBlock(channels)
-        elif NO_type == "Mamba":
+        elif self.NO_type == "MAMBA":
             self.no = MambaBlock(
                 channels=channels, 
                 d_state=d_state, 
                 d_conv=d_conv, 
                 expand=expand
             )
+        else:
+            raise ValueError(f"Unknown NO_type: {NO_type}. Supported: FNO, WNO, MLP, CNN, Mamba")
         
+        # Post-operator normalization
         self.norm = norm_layer(channels)
-        # Relative position encoding → fused into features before any block execution
+        
+        # --- FIX: Pre-operator normalization to stabilize inputs to Mamba ---
+        self.pre_norm = norm_layer(channels)
+        
         self.rel_pos_enc = RelativePositionEncoding(channels)
 
     def forward(self, feat: torch.Tensor, coord: torch.Tensor, offset: torch.Tensor = None) -> torch.Tensor:
@@ -635,9 +560,12 @@ class NOGlobalBranch(nn.Module):
         feat = feat + pos_enc                         # in-place add, keeps grad
 
         # =========================================================================
-        # PARADIGM A: GRID-FREE SEQUENTIAL PATH
+        # PARADIGM A: GRID-FREE SEQUENTIAL PATH (Mamba)
         # =========================================================================
-        if self.NO_type == "Mamba":
+        if self.NO_type == "MAMBA":
+            # --- FIX: Stabilize feature variance before executing selective scans ---
+            feat = self.pre_norm(feat)
+            
             # Pass directly to our standalone MambaBlock
             feat_out = self.no(feat, coord, offset)
             return self.norm(feat_out)
@@ -656,12 +584,13 @@ class NOGlobalBranch(nn.Module):
             G_max = torch.tensor(
                 [Gx - 1, Gy - 1, Gz - 1], device=device, dtype=torch.float32
             )
+            
+            # Safe voxel-index coordinate clamping per axis
             shifted = ((coord_f - coord_min) / scale * G_max).long()
-            shifted = shifted.clamp(
-                min=torch.zeros(3, device=device, dtype=torch.long),
-                max=G_max.long(),
-            )
-            flat_idx = shifted[:, 0] * (Gy * Gz) + shifted[:, 1] * Gz + shifted[:, 2]
+            shifted_x = shifted[:, 0].clamp(0, Gx - 1)
+            shifted_y = shifted[:, 1].clamp(0, Gy - 1)
+            shifted_z = shifted[:, 2].clamp(0, Gz - 1)
+            flat_idx = shifted_x * (Gy * Gz) + shifted_y * Gz + shifted_z
 
             grid_flat = torch.zeros(Gx * Gy * Gz, C, device=device, dtype=dtype)
             count = torch.zeros(Gx * Gy * Gz, 1, device=device, dtype=dtype)
@@ -680,10 +609,8 @@ class NOGlobalBranch(nn.Module):
 
             return self.norm(feat_out)
 
-
 # ---------------------------------------------------------------------------
-# NOFusedGridPooling
-# Replaces NOFusedPooling; uses GridPooling + Universal NO branch
+# NOFusedGridPooling (Fixed: Added point.offset passage)
 # ---------------------------------------------------------------------------
 
 class NOFusedGridPooling(PointModule):
@@ -720,7 +647,6 @@ class NOFusedGridPooling(PointModule):
                 "universal_no_branch must be provided when enable_no=True"
             self.no_branch = universal_no_branch
 
-            # Per-layer lightweight adapters (cheap)
             self.down_proj = nn.Linear(in_channels, universal_dim)
             self.up_proj   = nn.Linear(universal_dim, out_channels)
 
@@ -734,7 +660,8 @@ class NOFusedGridPooling(PointModule):
         if self.enable_no:
             # Compress to universal dim → NO → expand to out_channels
             feat_down   = self.down_proj(point.feat)
-            global_feat = self.no_branch(feat_down, point.grid_coord)
+            # FIX: Explicitly pass point.offset to isolate batch elements in MambaBlock
+            global_feat = self.no_branch(feat_down, point.grid_coord, offset=point.offset)
             feat_global = self.up_proj(global_feat)
 
         point = self.pool(point)
@@ -757,8 +684,7 @@ class NOFusedGridPooling(PointModule):
 
 
 # ---------------------------------------------------------------------------
-# NOFusedGridUnpooling
-# Replaces NOFusedUnpooling; uses GridUnpooling + Universal NO branch
+# NOFusedGridUnpooling (Fixed: Added point.offset passage)
 # ---------------------------------------------------------------------------
 
 class NOFusedGridUnpooling(PointModule):
@@ -812,10 +738,10 @@ class NOFusedGridUnpooling(PointModule):
     def forward(self, point: Point) -> Point:
         if self.enable_no:
             feat_down   = self.down_proj(point.feat)
-            global_feat = self.no_branch(feat_down, point.grid_coord)
+            # FIX: Explicitly pass point.offset to isolate batch elements in MambaBlock
+            global_feat = self.no_branch(feat_down, point.grid_coord, offset=point.offset)
             feat_global = self.up_proj(global_feat)
 
-        # Optional skip-connection scaling
         parent = point.pooling_parent
         if not self.use_skip:
             parent.feat = torch.zeros_like(parent.feat)
@@ -842,7 +768,7 @@ class NOFusedGridUnpooling(PointModule):
 
 
 # ---------------------------------------------------------------------------
-# PointTransformerV3_NO  — Universal Branch + Grid Pool/Unpool
+# PointTransformerV3_NO
 # ---------------------------------------------------------------------------
 
 @MODELS.register_module("PT-v3m1-NO-SharedBranch")
@@ -867,7 +793,6 @@ class PointTransformerV3_NO(PointModule):
         enable_flash: bool = True,
         upcast_attention: bool = False,
         upcast_softmax: bool = False,
-        # ---- NO parameters ----
         no_stages=(True, True, True, True),
         fno_modes: int = 16,
         base_grid_size: tuple = (128, 128, 128),
@@ -877,7 +802,6 @@ class PointTransformerV3_NO(PointModule):
         share_no_branch: bool = True,
         universal_dim: int = 128,
         NO_type: str = "FNO",
-        # ---- GridPooling parameters ----
         pool_reduce: str = "max",
     ):
         super().__init__()
@@ -892,9 +816,6 @@ class PointTransformerV3_NO(PointModule):
         self.embedding = Embedding(in_channels, enc_channels[0], bn_layer, act_layer)
         dec_channels_  = list(dec_channels) + [enc_channels[-1]]
 
-        # ==============================================================
-        # ONE Universal NOGlobalBranch — shared by ALL layers
-        # ==============================================================
         if share_no_branch:
             self.universal_no_branch = NOGlobalBranch(
                 channels=universal_dim,
@@ -906,9 +827,7 @@ class PointTransformerV3_NO(PointModule):
         else:
             self.universal_no_branch = None
 
-        # ------------------------------------------------------------------ #
-        # Encoder
-        # ------------------------------------------------------------------ #
+        # Encoder Path
         enc_drop_path = [
             x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))
         ]
@@ -954,9 +873,7 @@ class PointTransformerV3_NO(PointModule):
                 )
             self.enc.add(module=enc, name=f"enc{s}")
 
-        # ------------------------------------------------------------------ #
-        # Decoder
-        # ------------------------------------------------------------------ #
+        # Decoder Path
         dec_drop_path = [
             x.item() for x in torch.linspace(0, drop_path, sum(dec_depths))
         ]
