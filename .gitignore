@@ -6,6 +6,8 @@ __pycache__
 *.so
 *.pth
 *.log
+events.out.tfevents.*
+result
 weights
 data
 *log*
@@ -16,4 +18,4 @@ outputs/
 **/*.out
 Dockerfile
 ai
-mamba/
+mamba

@@ -2,7 +2,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 20
+batch_size = 12
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -37,7 +37,7 @@ model = dict(
     backbone_out_channels=64,
     backbone=dict(
         type="PT-v3m1-NO-SharedBranch",
-        in_channels=6,
+        in_channels=4,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
 
@@ -103,7 +103,7 @@ data = dict(
     num_classes=len(names), 
     ignore_index=-1,
     names=names,
-   train=dict(
+    train=dict(
         type=dataset_type,
         split="train",
         data_root=data_root,
