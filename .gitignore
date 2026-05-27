@@ -4,7 +4,8 @@ __pycache__
 **/*.egg-info/
 **/dist/
 *.so
-exp
+*.pth
+*.log
 weights
 data
 *log*
