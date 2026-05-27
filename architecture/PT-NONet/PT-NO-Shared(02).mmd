@@ -1,4 +1,4 @@
-flowchart TB
+flowchart LR
     Input((Input Points)) --> Embed[Point Embedding]
     %% Shared NO Registry
     subgraph Registry [Shared NOGlobalBranch]
@@ -20,7 +20,7 @@ flowchart TB
     pool3 --> NO256
     NO256 --> unpool3 
 
-    subgraph Backbone [PT-NOE Encoder-Decoder Backbone]
+    subgraph Backbone
         direction TB
         subgraph Encoder [Encoder Path]
             direction TB
@@ -46,9 +46,9 @@ flowchart TB
 
             unpool3 --> D3 --> unpool2 --> D2 --> unpool1 --> D1
         end
-    end
+   end
 
-    Embed --> Backbone
+    Embed --> E1
     E4 --> unpool3
     
     %% Skip Connections
@@ -56,11 +56,12 @@ flowchart TB
     E2 -. "Skip Features" .-> unpool2
     E1 -. "Skip Features" .-> unpool1
     
-    Backbone --> Output((Segmentation Output))
+    D1 --> Output((Segmentation Output))
 
     style Registry fill:#f9f2f4,stroke:#333,stroke-width:2px
     style NO64 fill:#d4e6f1,stroke:#8e44ad,stroke-width:2px
     style NO128 fill:#d4e6f1,stroke:#8e44ad,stroke-width:2px
     style NO256 fill:#d4e6f1,stroke:#8e44ad,stroke-width:2px
+    style Backbone stroke-width:0px
 
     
