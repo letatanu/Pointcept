@@ -5,6 +5,7 @@ batch_size = 9  # bs: total bs in all gpus
 mix_prob = 0.8
 empty_cache = False
 enable_amp = True
+clip_grad = 1.0
 # model settings
 model = dict(
     type="DefaultSegmentorV2",

@@ -1,0 +1,160 @@
+flowchart TD
+    INPUT["🔵 Input Point Cloud\n(N × 6: color + normal)\ngrid_size=0.02m · max 204800pts"]
+
+    EMB["Embedding\nLinear(6→32) → BN → GELU\nout: 32ch"]
+
+    %% ── SHARED NO BRANCH (MLP3dBlock, dim=64, grid=64³) ──
+    subgraph NOBRANCH["🌐 Universal NOGlobalBranch  (SHARED · NO_type=MLP · dim=64 · grid=64³)"]
+        RPE["RelativePositionEncoding\nLinear(4→64)→LN→GELU→Linear(64→64)\n(dx,dy,dz,radius) → (N,64)"]
+        subgraph MLP3D["MLP3dBlock (replaces FNO/WNO)"]
+            GAVG["AdaptiveAvgPool3d(1) → global ctx\nConv3d(64→128,1)→GELU→Conv3d(128→64,1)"]
+            LMLP["Local MLP\nConv3d(64→128,1)→GELU→Conv3d(128→64,1)"]
+            BYP["bypass Conv3d(64,64,1)"]
+            MFUSE["out = local + global (broadcast) + bypass"]
+            GAVG --> MFUSE
+            LMLP --> MFUSE
+            BYP  --> MFUSE
+        end
+        NOLN["LayerNorm(64)"]
+        RPE --> MLP3D --> NOLN
+    end
+
+    %% ── ENCODER ──────────────────────────────────────────
+    subgraph ENC0["enc0 | 32ch  (4 blocks, no downsample)"]
+        E0B0["Block0 · heads=2 · patch=1024 · z-curve"]
+        E0B1["Block1 · heads=2 · z-trans"]
+        E0B2["Block2 · heads=2 · hilbert"]
+        E0B3["Block3 · heads=2 · hilbert-trans"]
+        E0B0-->E0B1-->E0B2-->E0B3
+    end
+
+    subgraph DOWN0["NOFusedGridPooling 0 | 32→64ch · stride=2"]
+        D0_DP["down_proj Linear(32→64)  →  NOGlobalBranch  →  up_proj Linear(64→64)"]
+        D0_GP["GridPooling: Linear(32→64)→BN→GELU, scatter_max"]
+        D0_FU["concat fusion: cat(pool_feat, no_feat) → Linear(128→64)+LN"]
+        D0_DP --> D0_FU
+        D0_GP --> D0_FU
+    end
+
+    subgraph ENC1["enc1 | 64ch  (4 blocks)"]
+        E1B0["Block0 · heads=4"] --> E1B1["Block1 · heads=4"] --> E1B2["Block2 · heads=4"] --> E1B3["Block3 · heads=4"]
+    end
+
+    subgraph DOWN1["NOFusedGridPooling 1 | 64→128ch · stride=2"]
+        D1_DP["down_proj Linear(64→64)  →  NOGlobalBranch  →  up_proj Linear(64→128)"]
+        D1_GP["GridPooling: Linear(64→128)→BN→GELU, scatter_max"]
+        D1_FU["concat fusion: Linear(256→128)+LN"]
+        D1_DP --> D1_FU
+        D1_GP --> D1_FU
+    end
+
+    subgraph ENC2["enc2 | 128ch  (2 blocks)"]
+        E2B0["Block0 · heads=8"] --> E2B1["Block1 · heads=8"]
+    end
+
+    subgraph DOWN2["NOFusedGridPooling 2 | 128→256ch · stride=2"]
+        D2_DP["down_proj Linear(128→64)  →  NOGlobalBranch  →  up_proj Linear(64→256)"]
+        D2_GP["GridPooling: Linear(128→256)→BN→GELU, scatter_max"]
+        D2_FU["concat fusion: Linear(512→256)+LN"]
+        D2_DP --> D2_FU
+        D2_GP --> D2_FU
+    end
+
+    subgraph ENC3["enc3 | 256ch  (6 blocks — deepest pre-bottleneck)"]
+        E3B0["Block0 · heads=16"] --> E3B1["Block1"] --> E3B2["Block2"] --> E3B3["Block3"] --> E3B4["Block4"] --> E3B5["Block5 · heads=16"]
+    end
+
+    subgraph DOWN3["NOFusedGridPooling 3 | 256→512ch · stride=2"]
+        D3_DP["down_proj Linear(256→64)  →  NOGlobalBranch  →  up_proj Linear(64→512)"]
+        D3_GP["GridPooling: Linear(256→512)→BN→GELU, scatter_max"]
+        D3_FU["concat fusion: Linear(1024→512)+LN"]
+        D3_DP --> D3_FU
+        D3_GP --> D3_FU
+    end
+
+    subgraph ENC4["enc4 | 512ch  (2 blocks — bottleneck)"]
+        E4B0["Block0 · heads=32 · patch=1024"] --> E4B1["Block1 · heads=32"]
+    end
+
+    %% ── DECODER ──────────────────────────────────────────
+    subgraph UP3["NOFusedGridUnpooling 3 | 512→256ch"]
+        U3_DP["down_proj Linear(512→64)  →  NOGlobalBranch  →  up_proj Linear(64→256)"]
+        U3_GU["GridUnpooling:\nproj_skip Linear(256→256)+BN+GELU  (enc3 skip · learnable weight)\nproj Linear(512→256)+BN+GELU  (upsample via pooling_inverse)"]
+        U3_FU["concat fusion: cat(unpool_feat, no_feat) → Linear(512→256)+LN"]
+        U3_DP --> U3_FU
+        U3_GU --> U3_FU
+    end
+
+    subgraph DEC3["dec3 | 256ch  (2 blocks)"]
+        D3B0["Block0 · heads=16"] --> D3B1["Block1 · heads=16"]
+    end
+
+    subgraph UP2["NOFusedGridUnpooling 2 | 256→128ch"]
+        U2_DP["down_proj Linear(256→64)  →  NOGlobalBranch  →  up_proj Linear(64→128)"]
+        U2_GU["GridUnpooling:\nproj_skip Linear(128→128)+BN+GELU  (enc2 skip · learnable weight)\nproj Linear(256→128)+BN+GELU"]
+        U2_FU["concat fusion: Linear(256→128)+LN"]
+        U2_DP --> U2_FU
+        U2_GU --> U2_FU
+    end
+
+    subgraph DEC2["dec2 | 128ch  (2 blocks)"]
+        D2B0["Block0 · heads=8"] --> D2B1["Block1 · heads=8"]
+    end
+
+    subgraph UP1["NOFusedGridUnpooling 1 | 128→64ch"]
+        U1_DP["down_proj Linear(128→64)  →  NOGlobalBranch  →  up_proj Linear(64→64)"]
+        U1_GU["GridUnpooling:\nproj_skip Linear(64→64)+BN+GELU  (enc1 skip · learnable weight)\nproj Linear(128→64)+BN+GELU"]
+        U1_FU["concat fusion: Linear(128→64)+LN"]
+        U1_DP --> U1_FU
+        U1_GU --> U1_FU
+    end
+
+    subgraph DEC1["dec1 | 64ch  (2 blocks)"]
+        D1B0["Block0 · heads=4"] --> D1B1["Block1 · heads=4"]
+    end
+
+    subgraph UP0["NOFusedGridUnpooling 0 | 64→64ch"]
+        U0_DP["down_proj Linear(64→64)  →  NOGlobalBranch  →  up_proj Linear(64→64)"]
+        U0_GU["GridUnpooling:\nproj_skip Linear(32→64)+BN+GELU  (enc0 skip · learnable weight)\nproj Linear(64→64)+BN+GELU"]
+        U0_FU["concat fusion: Linear(128→64)+LN"]
+        U0_DP --> U0_FU
+        U0_GU --> U0_FU
+    end
+
+    subgraph DEC0["dec0 | 64ch  (2 blocks)"]
+        D0B0["Block0 · heads=4"] --> D0B1["Block1 · heads=4"]
+    end
+
+    subgraph SEG["DefaultSegmentorV2  (seg head)"]
+        LIN["Linear(64→13)\n13 classes: ceiling/floor/wall/beam/column/window/door/table/chair/sofa/bookcase/board/clutter"]
+        LOSS["CrossEntropyLoss (w=1.0) + LovaszLoss (w=1.0)"]
+        LIN --> LOSS
+    end
+
+    %% ── MAIN FLOW ─────────────────────────────────────────
+    INPUT --> EMB --> ENC0
+    ENC0  --> DOWN0 --> ENC1
+    ENC1  --> DOWN1 --> ENC2
+    ENC2  --> DOWN2 --> ENC3
+    ENC3  --> DOWN3 --> ENC4
+    ENC4  --> UP3   --> DEC3
+    DEC3  --> UP2   --> DEC2
+    DEC2  --> UP1   --> DEC1
+    DEC1  --> UP0   --> DEC0
+    DEC0  --> SEG
+
+    %% ── SKIP CONNECTIONS (enc feat → GridUnpooling proj_skip) ──
+    ENC3 -. "skip 256ch · learnable stage_weight" .-> UP3
+    ENC2 -. "skip 128ch · learnable stage_weight" .-> UP2
+    ENC1 -. "skip 64ch  · learnable stage_weight" .-> UP1
+    ENC0 -. "skip 32ch  · learnable stage_weight" .-> UP0
+
+    %% ── ALL POOL/UNPOOL CALL SHARED NO BRANCH ──────────────
+    DOWN0 -. "calls (shared)" .-> NOBRANCH
+    DOWN1 -. "calls (shared)" .-> NOBRANCH
+    DOWN2 -. "calls (shared)" .-> NOBRANCH
+    DOWN3 -. "calls (shared)" .-> NOBRANCH
+    UP3   -. "calls (shared)" .-> NOBRANCH
+    UP2   -. "calls (shared)" .-> NOBRANCH
+    UP1   -. "calls (shared)" .-> NOBRANCH
+    UP0   -. "calls (shared)" .-> NOBRANCH
