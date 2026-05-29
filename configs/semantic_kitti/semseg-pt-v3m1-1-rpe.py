@@ -6,7 +6,7 @@ num_worker = 24
 mix_prob = 0.8
 empty_cache = False
 enable_amp = True
-
+amp_dtype = 'bfloat16'
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
@@ -56,7 +56,7 @@ model = dict(
 )
 
 # scheduler settings
-epoch = 50
+epoch = 500
 eval_epoch = 50
 optimizer = dict(type="AdamW", lr=0.002, weight_decay=0.005)
 scheduler = dict(

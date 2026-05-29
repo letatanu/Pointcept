@@ -1,4 +1,4 @@
-# configs/s3dis/semseg-pt-v3m1-no-encoder-enhanced.py
+configs/s3dis/semseg-pt-v3-no-v2-0.py# configs/s3dis/semseg-pt-v3m1-no-encoder-enhanced.py
 
 _base_ = ["../_base_/default_runtime.py"]
 

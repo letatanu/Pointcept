@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="4,5,6,7"
+DEVICES="all"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -13,8 +13,8 @@ DOCKER_IMAGE="letatanu/pointcept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="PT-v3m1-NO-SharedBranch"
-EXP_NAME="semseg-pt-v3-no-v2_05"
-CONFIG_PATH="semseg-pt-v3-no-v2-0"
+EXP_NAME="semseg-pt-v3-no-v2_04"
+CONFIG_PATH="semseg-pt-v3-no-v2-1"
 ## --------------------------------------------------------- ##
 DATASET="semantic_kitti"
 echo "Model Name: $MODEL_NAME"

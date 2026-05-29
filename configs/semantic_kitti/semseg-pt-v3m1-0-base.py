@@ -1,11 +1,12 @@
 _base_ = ["../_base_/default_runtime.py"]
 
 # misc custom setting
-batch_size = 9  # bs: total bs in all gpus
+batch_size = 24  # bs: total bs in all gpus
 mix_prob = 0.8
 empty_cache = False
 enable_amp = True
 clip_grad = 1.0
+amp_dtype = 'bfloat16'
 # model settings
 model = dict(
     type="DefaultSegmentorV2",
@@ -54,8 +55,8 @@ model = dict(
     ],
 )
 # scheduler settings
-epoch = 50
-eval_epoch = 50
+epoch = 1000
+eval_epoch = 100
 optimizer = dict(type="AdamW", lr=0.002, weight_decay=0.005)
 scheduler = dict(
     type="OneCycleLR",
