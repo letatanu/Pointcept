@@ -13,8 +13,8 @@ DOCKER_IMAGE="letatanu/poincept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="PT-v3m1-NO-SharedBranch"
-EXP_NAME="semseg-pt-v3-no-v2_01"
-CONFIG_PATH="semseg-pt-v3-no-v2"
+EXP_NAME="semseg-pt-v3-no-v2-1_01"
+CONFIG_PATH="semseg-pt-v3-no-v2-1"
 ## --------------------------------------------------------- ##
 DATASET="scannet"
 echo "Model Name: $MODEL_NAME"
@@ -24,8 +24,7 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
   --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
-  -v /media/volume/data/project/semantic_3d/Pointcept/:/working \
-  -v /media/volume/data/project/semantic_3d/data/:/working/data \
+  -v /data/nhl224/code/semantic_3D/Pointcept/:/working \
   -e OMP_NUM_THREADS=${OMP_NUM_THREADS} \
   "${DOCKER_IMAGE}"    \
   bash -lc "

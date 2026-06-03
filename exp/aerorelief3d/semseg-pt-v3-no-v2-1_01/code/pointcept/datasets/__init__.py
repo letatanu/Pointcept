@@ -16,7 +16,7 @@ from .semantic_kitti import SemanticKITTIDataset
 from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
 from .aerorelief3d import AeroRelief3DDataset
-
+from .dales import DALESDataset
 # object
 from .modelnet import ModelNetDataset
 from .shapenet_part import ShapeNetPartDataset

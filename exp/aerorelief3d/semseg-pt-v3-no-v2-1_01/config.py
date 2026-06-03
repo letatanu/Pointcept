@@ -1,8 +1,8 @@
-weight = 'exp/aerorelief3d/semseg-pt-v3-no-v2-1_01/model/model_best.pth'
+weight = None
 resume = False
 evaluate = True
 test_only = False
-seed = 30110611
+seed = 25563834
 save_path = 'exp/aerorelief3d/semseg-pt-v3-no-v2-1_01'
 num_worker = 24
 batch_size = 16
