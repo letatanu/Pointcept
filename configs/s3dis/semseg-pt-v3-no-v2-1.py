@@ -2,7 +2,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 32
+batch_size = 21
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -49,7 +49,7 @@ model = dict(
         share_no_branch=True,
         universal_dim=64,
         pool_reduce="max",
-        NO_type="Mamba",  # Using MLP in this version for faster processing
+        NO_type="WNO",  # Using MLP in this version for faster processing
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
@@ -57,7 +57,7 @@ model = dict(
     ],
 )
 
-epoch = 3000
+epoch = 2000
 eval_epoch = 100
 
 optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
@@ -73,7 +73,7 @@ scheduler = dict(
 param_dicts = [dict(keyword="block", lr=0.0006)]
 
 dataset_type = "S3DISDataset"
-data_root = "data/S3DIS/pointcept"
+data_root = "data/s3dis"
 
 data = dict(
     num_classes=13,

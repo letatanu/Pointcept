@@ -13,8 +13,8 @@ DOCKER_IMAGE="letatanu/poincept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="dales"
-EXP_NAME="semseg-pt-v3-no-v2-1_02"
-CONFIG_PATH="semseg-pt-v3-no-v2-1"
+EXP_NAME="semseg-pt-v3-no-v2-1-half_02"
+CONFIG_PATH="semseg-pt-v3-no-v2-1-half"
 
 ## --------------------------------------------------------- ##
 DATASET="dales"
@@ -32,4 +32,5 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
       -p python \
       -d ${DATASET} \
       -c ${CONFIG_PATH} \
-      -n ${EXP_NAME}"
+      -n ${EXP_NAME} \
+      -r true"
