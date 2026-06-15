@@ -70,12 +70,15 @@ class GridPooling(PointModule):
                 "[grid_coord] or [coord, grid_size] should be in the Point"
             )
         grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc")
-        grid_coord = grid_coord | point.batch.view(-1, 1) << 48
+        # was: grid_coord = grid_coord | point.batch.view(-1, 1) << 48
+        grid_coord = grid_coord.long() | point.batch.view(-1, 1).long() << 48
+
         grid_coord, cluster, counts = torch.unique(
             grid_coord, sorted=True,
             return_inverse=True, return_counts=True, dim=0,
         )
-        grid_coord = grid_coord & ((1 << 48) - 1)
+        # was: grid_coord = grid_coord & ((1 << 48) - 1)
+        grid_coord = (grid_coord & ((1 << 48) - 1)).long()
         _, indices = torch.sort(cluster)
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         head_indices = indices[idx_ptr[:-1]]
@@ -117,7 +120,6 @@ class GridPooling(PointModule):
         point.serialization(order=order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
         return point
-
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +345,8 @@ class NOGlobalBranch(nn.Module):
         self.norm      = norm_layer(channels)
         self.grid_size = grid_size
         # Relative position encoding → fused into features before FFT
-        self.rel_pos_enc = RelativePositionEncoding(channels)
+        # self.rel_pos_enc = RelativePositionEncoding(channels)
+        self.rel_pos_enc = QuatRPE(channels, num_freqs=8)
 
     def forward(self, feat: torch.Tensor, coord: torch.Tensor) -> torch.Tensor:
         """
@@ -443,30 +446,7 @@ class NOFusedGridPooling(PointModule):
                 nn.LayerNorm(out_channels),
             )
 
-    # def forward(self, point: Point) -> Point:
-    #     if self.enable_no:
-    #         # Compress to universal dim → NO → expand to out_channels
-    #         feat_down   = self.down_proj(point.feat)
-    #         global_feat = self.no_branch(feat_down, point.grid_coord)
-    #         feat_global = self.up_proj(global_feat)
 
-    #     point = self.pool(point)
-
-    #     if self.enable_no:
-    #         inv            = point.pooling_inverse
-    #         feat_no_coarse = torch_scatter.scatter_max(feat_global, inv, dim=0)[0]
-
-    #         if self.fusion == "add":
-    #             unused     = sum(p.sum() * 0 for p in self.proj_concat.parameters())
-    #             point.feat = point.feat + self.gate.sigmoid() * feat_no_coarse + unused
-    #         elif self.fusion == "concat":
-    #             unused     = self.gate.sum() * 0
-    #             point.feat = self.proj_concat(
-    #                 torch.cat([point.feat, feat_no_coarse], dim=-1)
-    #             ) + unused
-
-    #     point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
-    #     return point
     def forward(self, point: Point) -> Point:
         if self.enable_no:
             # 1. Project input to universal dim (N_in, universal_dim)

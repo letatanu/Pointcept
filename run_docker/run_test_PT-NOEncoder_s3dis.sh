@@ -18,6 +18,7 @@ echo "Model Name: $MODEL_NAME"
 echo "Devices: $DEVICES"
 
 docker run --ulimit nofile=1048576:1048576 --ipc=host \
+  --shm-size=32g \
   --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
