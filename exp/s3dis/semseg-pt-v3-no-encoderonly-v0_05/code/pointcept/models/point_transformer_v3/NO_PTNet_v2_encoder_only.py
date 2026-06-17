@@ -624,11 +624,6 @@ class NOFusedGridPooling(PointModule):
 
 
     def forward(self, point: Point) -> Point:
-        # In GridPooling.forward — add to the pooled point_dict:
-        if "normal" in point.keys():
-            point_dict["normal"] = torch_scatter.segment_csr(
-                point.normal[indices], idx_ptr, reduce="mean"
-            )
         if self.enable_no:
             # 1. Project input to universal dim (N_in, universal_dim)
             feat_down = self.down_proj(point.feat)
