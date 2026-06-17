@@ -70,15 +70,12 @@ class GridPooling(PointModule):
                 "[grid_coord] or [coord, grid_size] should be in the Point"
             )
         grid_coord = torch.div(grid_coord, self.stride, rounding_mode="trunc")
-       # was: grid_coord = grid_coord | point.batch.view(-1, 1) << 48
-        grid_coord = grid_coord.long() | point.batch.view(-1, 1).long() << 48
-
+        grid_coord = grid_coord | point.batch.view(-1, 1) << 48
         grid_coord, cluster, counts = torch.unique(
             grid_coord, sorted=True,
             return_inverse=True, return_counts=True, dim=0,
         )
-        # was: grid_coord = grid_coord & ((1 << 48) - 1)
-        grid_coord = (grid_coord & ((1 << 48) - 1)).long()
+        grid_coord = grid_coord & ((1 << 48) - 1)
         _, indices = torch.sort(cluster)
         idx_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         head_indices = indices[idx_ptr[:-1]]
@@ -103,15 +100,8 @@ class GridPooling(PointModule):
             point_dict["color"] = torch_scatter.segment_csr(
                 point.color[indices], idx_ptr, reduce="mean"
             )
-            
-        if "normal" in point.keys():
-            point_dict["normal"] = torch_scatter.segment_csr(
-                point.normal[indices], idx_ptr, reduce="mean"
-            )
-            
         if "grid_size" in point.keys():
             point_dict["grid_size"] = point.grid_size * self.stride
-            
 
         if self.traceable:
             point_dict["pooling_inverse"] = cluster
@@ -130,174 +120,48 @@ class GridPooling(PointModule):
 
 
 # ---------------------------------------------------------------------------
-# QuatRPE — Normal-Aware Quaternion Rotational Position Embedding
-# Extends the original QuatRPE with surface normal orientation encoding.
-#
-# Change summary vs. original:
-#   - __init__: in_dim expanded from (4 + num_freqs) to (8 + num_freqs)
-#               to accommodate both pos_quat (4) + normal_quat (4).
-#               Added `use_normal` flag for graceful fallback.
-#   - forward:  builds a second quaternion from point.normal (if available),
-#               concatenates [pos_quat | normal_quat | r_freq] before proj.
-#               Falls back to zero normal_quat if point.normal is absent.
+# GridUnpooling  (from Sonata / PT-v3m2)
 # ---------------------------------------------------------------------------
 
-class QuatRPE(nn.Module):
-    """
-    Encodes relative 3D positions AND surface orientations via dual unit
-    quaternions (RoPE-style), then projects to out_channels.
-
-    Position branch  : quaternion built from (coord - centroid)
-    Orientation branch: quaternion built from surface normal vector
-
-    Both quaternions are concatenated with multi-frequency radius encoding
-    and projected to out_channels via a shared MLP.
-
-    Args:
-        out_channels : output feature dimension
-        num_freqs    : number of NeRF-style radius frequency bands
-        use_normal   : if False, disables normal branch (reverts to original)
-    """
-
-    def __init__(self, out_channels: int, num_freqs: int = 8, use_normal: bool = True):
+class GridUnpooling(PointModule):
+    def __init__(
+        self,
+        in_channels,
+        skip_channels,
+        out_channels,
+        norm_layer=None,
+        act_layer=None,
+        traceable=False,
+    ):
         super().__init__()
-        self.num_freqs  = num_freqs
-        self.use_normal = use_normal
+        self.proj      = PointSequential(nn.Linear(in_channels, out_channels))
+        self.proj_skip = PointSequential(nn.Linear(skip_channels, out_channels))
 
-        # pos_quat (4) + normal_quat (4, if use_normal) + r_freq (num_freqs)
-        in_dim = (4 + 4 + num_freqs) if use_normal else (4 + num_freqs)
+        if norm_layer is not None:
+            self.proj.add(norm_layer(out_channels))
+            self.proj_skip.add(norm_layer(out_channels))
+        if act_layer is not None:
+            self.proj.add(act_layer())
+            self.proj_skip.add(act_layer())
 
-        self.proj = nn.Sequential(
-            nn.Linear(in_dim, out_channels),
-            nn.LayerNorm(out_channels),
-            nn.GELU(),
-            nn.Linear(out_channels, out_channels),
-        )
+        self.traceable = traceable
 
-        # Log-spaced frequency bands for radius encoding (like NeRF)
-        freqs = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs)
-        self.register_buffer("freqs", freqs)  # (num_freqs,)
+    def forward(self, point: Point):
+        assert "pooling_parent"  in point.keys()
+        assert "pooling_inverse" in point.keys()
+        parent  = point.pop("pooling_parent")
+        inverse = point.pooling_inverse
+        feat    = point.feat
 
-    @staticmethod
-    def _build_quaternion(delta: torch.Tensor) -> torch.Tensor:
-        """
-        Build a unit quaternion from an arbitrary 3D vector.
-        Works for both displacement vectors (position) and normal vectors
-        (orientation) — the vector is treated as the rotation axis.
+        parent       = self.proj_skip(parent)
+        parent.feat  = parent.feat + self.proj(point).feat[inverse]
+        parent.sparse_conv_feat = parent.sparse_conv_feat.replace_feature(parent.feat)
 
-        delta : (N, 3)
-        Returns: (N, 4)  [w, x, y, z]
-        """
-        norm = delta.norm(dim=1, keepdim=True).clamp(min=1e-6)  # (N, 1)
-        axis = delta / norm                                       # (N, 3) unit axis
-        # Map ||delta|| -> rotation angle in [0, pi] via sigmoid scaling
-        theta = torch.sigmoid(norm) * torch.pi                   # (N, 1)
-        half  = theta * 0.5
-        w   = torch.cos(half)                                     # (N, 1)
-        xyz = torch.sin(half) * axis                              # (N, 3)
-        return torch.cat([w, xyz], dim=1)                         # (N, 4)
+        if self.traceable:
+            point.feat = feat
+            parent["unpooling_parent"] = point
+        return parent
 
-    def forward(self, point) -> torch.Tensor:
-        coord_f  = point.coord.float()
-        centroid = coord_f.mean(dim=0, keepdim=True)
-        delta    = coord_f - centroid
-        radius   = delta.norm(dim=1, keepdim=True)
-        r_norm   = radius / (radius.max() + 1e-6)
-
-        pos_quat = self._build_quaternion(delta)
-        r_freq   = torch.sin(r_norm * self.freqs.unsqueeze(0))
-
-        if self.use_normal:
-            # Use point.keys() instead of hasattr — addict.Dict fakes all attributes
-            if "normal" in point.keys() and point.normal is not None:
-                normal_f = point.normal.float()
-            else:
-                normal_f = torch.zeros_like(coord_f)  # (N, 3) fallback
-
-            normal_quat = self._build_quaternion(normal_f)
-            feat = torch.cat([pos_quat, normal_quat, r_freq], dim=1)
-        else:
-            feat = torch.cat([pos_quat, r_freq], dim=1)
-
-        out = self.proj(feat)
-        if out.shape[1] % 4 == 0:
-            if self.use_normal and "normal" in point.keys():
-                composed_quat = compose_quaternions(pos_quat, normal_quat)
-                out = apply_quat_rotation_to_features(out, composed_quat)
-            else:
-                out = apply_quat_rotation_to_features(out, pos_quat)
-
-        return out
-class QuatRPEBlockWrapper(PointModule):
-    def __init__(self, block: nn.Module, channels: int, normal_feat_slice: slice = None):
-        """
-        Args:
-            block             : the underlying PTv3 Block
-            channels          : feature dimension at this stage
-            normal_feat_slice : slice into point.feat where raw normals live,
-                                e.g. slice(6, 9) for in_channels=9 at stage 0.
-                                None for all deeper stages — uses point.normal
-                                propagated by GridPooling instead.
-        """
-        super().__init__()
-        self.block             = block
-        self.rpe               = QuatRPE(channels, num_freqs=8, use_normal=True)
-        self.normal_feat_slice = normal_feat_slice
-
-    def forward(self, point: Point) -> Point:
-        # Use point.keys() — NOT hasattr, which always returns True for addict.Dict
-        if "normal" not in point.keys():
-            if self.normal_feat_slice is not None:
-                point.normal = point.feat[:, self.normal_feat_slice].detach()
-
-        pos_enc    = self.rpe(point).to(point.feat.dtype)
-        point.feat = point.feat + pos_enc
-
-        if hasattr(point, "sparse_conv_feat") and point.sparse_conv_feat is not None:
-            point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
-
-        return self.block(point)
-
-def compose_quaternions(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-    """
-    Hamilton product: q_out = q1 ⊗ q2
-    q1, q2 : (N, 4)  [w, x, y, z]
-    Returns : (N, 4) unit quaternion
-    """
-    w1, x1, y1, z1 = q1[:, 0], q1[:, 1], q1[:, 2], q1[:, 3]
-    w2, x2, y2, z2 = q2[:, 0], q2[:, 1], q2[:, 2], q2[:, 3]
-
-    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
-    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
-    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
-    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
-
-    composed = torch.stack([w, x, y, z], dim=1)  # (N, 4)
-    return composed / composed.norm(dim=1, keepdim=True).clamp(min=1e-6)
-
-def apply_quat_rotation_to_features(feat: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
-    """
-    Apply quaternion rotation to feature channels in consecutive pairs.
-    feat : (N, C)   — C must be divisible by 4
-    quat : (N, 4)   — unit quaternions [w, x, y, z]
-    Returns: (N, C) rotated features
-    """
-    N, C = feat.shape
-    assert C % 4 == 0, "Channel dim must be divisible by 4 for quaternion rotation"
-    # Reshape features as (N, C//4, 4) quaternion-like vectors
-    f = feat.view(N, C // 4, 4)
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]  # (N,)
-
-    fw, fx, fy, fz = f[..., 0], f[..., 1], f[..., 2], f[..., 3]  # (N, C//4)
-
-    # Hamilton product: q ⊗ f_vec ⊗ q*
-    # Using efficient formula for sandwich product:
-    rw = w.unsqueeze(1)*fw - x.unsqueeze(1)*fx - y.unsqueeze(1)*fy - z.unsqueeze(1)*fz
-    rx = w.unsqueeze(1)*fx + x.unsqueeze(1)*fw + y.unsqueeze(1)*fz - z.unsqueeze(1)*fy
-    ry = w.unsqueeze(1)*fy - x.unsqueeze(1)*fz + y.unsqueeze(1)*fw + z.unsqueeze(1)*fx
-    rz = w.unsqueeze(1)*fz + x.unsqueeze(1)*fy - y.unsqueeze(1)*fx + z.unsqueeze(1)*fw
-
-    return torch.stack([rw, rx, ry, rz], dim=-1).view(N, C)
 
 # ---------------------------------------------------------------------------
 # RelativePositionEncoding
@@ -522,25 +386,25 @@ class NOGlobalBranch(nn.Module):
         self.norm      = norm_layer(channels)
         self.grid_size = grid_size
         # Relative position encoding → fused into features before FFT
-        # self.rel_pos_enc = RelativePositionEncoding(channels)
-        self.rel_pos_enc = QuatRPE(channels, num_freqs=8)  # More powerful RPE variant
+        self.rel_pos_enc = RelativePositionEncoding(channels)
 
-    def forward(self, feat: torch.Tensor, point: Point) -> torch.Tensor:
+    def forward(self, feat: torch.Tensor, coord: torch.Tensor) -> torch.Tensor:
         """
         Args:
             feat  : (N, C) — already projected to universal_dim by the caller
-            point : Point — the full point object for the current stage
+            coord : (N, 3) — grid_coord or coord of the current stage
+        Returns:
+            (N, C) — spectral-enriched features, same shape as input
         """
         Gx, Gy, Gz  = self.grid_size
         C            = feat.shape[1]
         device, dtype = feat.device, feat.dtype
 
-        # --- 1. Fuse relative position encoding into features ---\
-        pos_enc = self.rel_pos_enc(point).to(dtype)    # Pass full point object
-        feat    = feat + pos_enc                       
+        # --- 1. Fuse relative position encoding into features ---
+        pos_enc = self.rel_pos_enc(coord).to(dtype)   # (N, C)
+        feat    = feat + pos_enc                       # in-place add, keeps grad
 
-        # --- 2. Scatter points onto a dense regular grid ---\
-        coord = point.grid_coord                       # Use grid_coord for FNO 
+        # --- 2. Scatter points onto a dense regular grid ---
         coord_f   = coord.float()
         coord_min = coord_f.min(dim=0).values
         coord_max = coord_f.max(dim=0).values
@@ -622,19 +486,37 @@ class NOFusedGridPooling(PointModule):
                 nn.LayerNorm(out_channels),
             )
 
+    # def forward(self, point: Point) -> Point:
+    #     if self.enable_no:
+    #         # Compress to universal dim → NO → expand to out_channels
+    #         feat_down   = self.down_proj(point.feat)
+    #         global_feat = self.no_branch(feat_down, point.grid_coord)
+    #         feat_global = self.up_proj(global_feat)
 
+    #     point = self.pool(point)
+
+    #     if self.enable_no:
+    #         inv            = point.pooling_inverse
+    #         feat_no_coarse = torch_scatter.scatter_max(feat_global, inv, dim=0)[0]
+
+    #         if self.fusion == "add":
+    #             unused     = sum(p.sum() * 0 for p in self.proj_concat.parameters())
+    #             point.feat = point.feat + self.gate.sigmoid() * feat_no_coarse + unused
+    #         elif self.fusion == "concat":
+    #             unused     = self.gate.sum() * 0
+    #             point.feat = self.proj_concat(
+    #                 torch.cat([point.feat, feat_no_coarse], dim=-1)
+    #             ) + unused
+
+    #     point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
+    #     return point
     def forward(self, point: Point) -> Point:
-        # In GridPooling.forward — add to the pooled point_dict:
-        if "normal" in point.keys():
-            point_dict["normal"] = torch_scatter.segment_csr(
-                point.normal[indices], idx_ptr, reduce="mean"
-            )
         if self.enable_no:
             # 1. Project input to universal dim (N_in, universal_dim)
             feat_down = self.down_proj(point.feat)
             
             # 2. Extract Global Context via WNO (N_in, universal_dim)
-            global_feat = self.no_branch(feat_down, point)
+            global_feat = self.no_branch(feat_down, point.grid_coord)
 
         # 3. Downsample the backbone point cloud (N_in -> N_out)
         point = self.pool(point)
@@ -660,84 +542,98 @@ class NOFusedGridPooling(PointModule):
 
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
         return point
+
 # ---------------------------------------------------------------------------
-# NOLightweightUpsampleHead
-# Replaces the entire decoder.
-# Projects each encoder stage → head_channels, walks pooling_inverse chains
-# back to stage-0 resolution, then fuses with learnable stage weights.
+# NOFusedGridUnpooling
+# Replaces NOFusedUnpooling; uses GridUnpooling + Universal NO branch
 # ---------------------------------------------------------------------------
 
-class NOLightweightUpsampleHead(PointModule):
+class NOFusedGridUnpooling(PointModule):
     def __init__(
         self,
-        stage_channels,          # list: enc_channels, e.g. [32, 64, 128, 256, 512]
-        out_channels: int = 64,
-        fusion: str = "sum",     # "sum" | "concat"
-        norm_layer=nn.LayerNorm,
-        act_layer=nn.GELU,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        norm_layer=None,
+        act_layer=None,
+        enable_no: bool = False,
+        use_skip: bool = True,
+        fusion: str = "add",
+        learnable_stage_weights: bool = False,
+        universal_no_branch: nn.Module = None,
+        universal_dim: int = 64,
     ):
         super().__init__()
-        assert fusion in ("sum", "concat")
-        self.num_stages = len(stage_channels)
-        self.fusion = fusion
+        self.unpool = GridUnpooling(
+            in_channels=in_channels,
+            skip_channels=skip_channels,
+            out_channels=out_channels,
+            norm_layer=norm_layer,
+            act_layer=act_layer,
+            traceable=False,
+        )
+        self.enable_no              = enable_no
+        self.use_skip               = use_skip
+        self.fusion                 = fusion
+        self.learnable_stage_weights = learnable_stage_weights
 
-        # Lightweight per-stage projections
-        self.stage_proj = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(c, out_channels),
-                norm_layer(out_channels),
+        if learnable_stage_weights:
+            self.stage_weight = nn.Parameter(torch.ones(1))
+        else:
+            self.stage_weight = None
+
+        if enable_no:
+            assert universal_no_branch is not None, \
+                "universal_no_branch must be provided when enable_no=True"
+            self.no_branch = universal_no_branch
+
+            self.down_proj = nn.Linear(in_channels, universal_dim)
+            self.up_proj   = nn.Linear(universal_dim, out_channels)
+
+            self.gate = nn.Parameter(torch.full((1,), -4.0))
+            self.proj_concat = nn.Sequential(
+                nn.Linear(out_channels * 2, out_channels),
+                nn.LayerNorm(out_channels),
             )
-            for c in stage_channels
-        ])
 
-        # Learnable blend weights (softmax-normalized at runtime)
-        self.stage_weights = nn.Parameter(
-            torch.full((self.num_stages,), 1.0 / self.num_stages)
-        )
+    def forward(self, point: Point) -> Point:
+        if self.enable_no:
+            feat_down   = self.down_proj(point.feat)
+            global_feat = self.no_branch(feat_down, point.grid_coord)
+            feat_global = self.up_proj(global_feat)
 
-        in_ch = self.num_stages * out_channels if fusion == "concat" else out_channels
-        self.output_proj = nn.Sequential(
-            nn.Linear(in_ch, out_channels),
-            norm_layer(out_channels),
-            act_layer(),
-        )
+        # Optional skip-connection scaling
+        parent = point.pooling_parent
+        if not self.use_skip:
+            parent.feat = torch.zeros_like(parent.feat)
+        elif self.learnable_stage_weights and self.stage_weight is not None:
+            parent.feat = parent.feat * self.stage_weight
 
-    def _upsample_to_stage0(self, feat, stage_points, s):
-        """Walk pooling_inverse chain from stage s back to stage 0."""
-        for t in range(s, 0, -1):
-            inv = stage_points[t].pooling_inverse
-            feat = feat[inv]
-        return feat
+        inverse = point.pooling_inverse
+        point   = self.unpool(point)
 
-    def forward(self, stage_points):
-        weights = torch.softmax(self.stage_weights, dim=0)  # (num_stages,)
-        upsampled = []
-        for s in range(self.num_stages):
-            feat_s = self.stage_proj[s](stage_points[s].feat)   # (N_s, out_ch)
-            if s > 0:
-                feat_s = self._upsample_to_stage0(feat_s, stage_points, s)
-            upsampled.append(weights[s] * feat_s)
+        if self.enable_no:
+            feat_no_fine = feat_global[inverse]
 
-        fused = (
-            torch.stack(upsampled, dim=0).sum(dim=0)
-            if self.fusion == "sum"
-            else torch.cat(upsampled, dim=-1)
-        )
-        fused = self.output_proj(fused)
+            if self.fusion == "add":
+                unused     = sum(p.sum() * 0 for p in self.proj_concat.parameters())
+                point.feat = point.feat + self.gate.sigmoid() * feat_no_fine + unused
+            elif self.fusion == "concat":
+                unused     = self.gate.sum() * 0
+                point.feat = self.proj_concat(
+                    torch.cat([point.feat, feat_no_fine], dim=-1)
+                ) + unused
 
-        point = stage_points[0]
-        point.feat = fused
-        point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(fused)
+        point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
         return point
 
+
 # ---------------------------------------------------------------------------
-# PointTransformerV3_NO_EncoderOnly
-# Encoder-only PT-WNO: no decoder, no skip connections.
-# Uses GridPooling + WNO/FNO universal shared branch + lightweight upsample head.
+# PointTransformerV3_NO  — Universal Branch + Grid Pool/Unpool
 # ---------------------------------------------------------------------------
 
-@MODELS.register_module("PT-v3m1-NO-EncoderOnly")
-class PointTransformerV3_NO_EncoderOnly(PointModule):
+@MODELS.register_module("PT-v3m1-NO-SharedBranch")
+class PointTransformerV3_NO(PointModule):
     def __init__(
         self,
         in_channels: int = 6,
@@ -747,6 +643,10 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        dec_depths=(2, 2, 2, 2),
+        dec_channels=(64, 64, 128, 256),
+        dec_num_head=(4, 4, 8, 16),
+        dec_patch_size=(1024, 1024, 1024, 1024),
         mlp_ratio: int = 4,
         drop_path: float = 0.3,
         pre_norm: bool = True,
@@ -755,17 +655,17 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
         upcast_attention: bool = False,
         upcast_softmax: bool = False,
         # ---- NO parameters ----
-        no_stages=(True, True, True, True),   # one per transition (num_stages - 1)
-        fno_modes: int = 8,
-        base_grid_size: tuple = (64, 64, 64),
-        fusion: str = "concat",               # pooling NO fusion: "add" | "concat"
+        no_stages=(True, True, True, True),
+        fno_modes: int = 16,
+        base_grid_size: tuple = (128, 128, 128),
+        use_skip: bool = True,
+        fusion: str = "concat",
+        learnable_stage_weights: bool = True,
         share_no_branch: bool = True,
-        universal_dim: int = 64,
-        NO_type: str = "WNO",
+        universal_dim: int = 128,
+        NO_type: str = "FNO",
+        # ---- GridPooling parameters ----
         pool_reduce: str = "max",
-        # ---- Upsample head parameters ----
-        head_out_channels: int = 64,
-        head_fusion: str = "sum",             # head fusion: "sum" | "concat"
     ):
         super().__init__()
         self.num_stages     = len(enc_depths)
@@ -777,9 +677,10 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
         act_layer = nn.GELU
 
         self.embedding = Embedding(in_channels, enc_channels[0], bn_layer, act_layer)
+        dec_channels_  = list(dec_channels) + [enc_channels[-1]]
 
         # ==============================================================
-        # ONE Universal NOGlobalBranch — shared by ALL pooling layers
+        # ONE Universal NOGlobalBranch — shared by ALL layers
         # ==============================================================
         if share_no_branch:
             self.universal_no_branch = NOGlobalBranch(
@@ -787,23 +688,21 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
                 modes=fno_modes,
                 grid_size=base_grid_size,
                 norm_layer=ln_layer,
-                NO_type=NO_type,
+                NO_type=NO_type
             )
         else:
             self.universal_no_branch = None
 
         # ------------------------------------------------------------------ #
-        # Encoder stages
+        # Encoder
         # ------------------------------------------------------------------ #
         enc_drop_path = [
             x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))
         ]
-
-        self.enc_stages = nn.ModuleList()
+        self.enc = PointSequential()
         for s in range(self.num_stages):
-            enc_drop_path_ = enc_drop_path[sum(enc_depths[:s]): sum(enc_depths[:s + 1])]
+            enc_drop_path_ = enc_drop_path[sum(enc_depths[:s]) : sum(enc_depths[: s + 1])]
             enc = PointSequential()
-
             if s > 0:
                 enc.add(
                     NOFusedGridPooling(
@@ -821,46 +720,77 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
                     ),
                     name="down",
                 )
-
             for i in range(enc_depths[s]):
-                # Create the standard block
-                base_block = Block(
-                    channels=enc_channels[s],
-                    num_heads=enc_num_head[s],
-                    patch_size=enc_patch_size[s],
-                    mlp_ratio=mlp_ratio,
-                    drop_path=enc_drop_path_[i],
-                    norm_layer=ln_layer,
-                    act_layer=act_layer,
-                    pre_norm=pre_norm,
-                    order_index=i % len(self.order),
-                    cpe_indice_key=f"stage{s}",
-                    enable_flash=enable_flash,
-                    upcast_attention=upcast_attention,
-                    upcast_softmax=upcast_softmax,
-                )
-                
-                normal_slice = slice(6, 9) if s == 0 else None
-
                 enc.add(
-                    QuatRPEBlockWrapper(base_block, enc_channels[s],
-                                        normal_feat_slice=normal_slice),
+                    Block(
+                        channels=enc_channels[s],
+                        num_heads=enc_num_head[s],
+                        patch_size=enc_patch_size[s],
+                        mlp_ratio=mlp_ratio,
+                        drop_path=enc_drop_path_[i],
+                        norm_layer=ln_layer,
+                        act_layer=act_layer,
+                        pre_norm=pre_norm,
+                        order_index=i % len(self.order),
+                        cpe_indice_key=f"stage{s}",
+                        enable_flash=enable_flash,
+                        upcast_attention=upcast_attention,
+                        upcast_softmax=upcast_softmax,
+                    ),
                     name=f"block{i}",
                 )
-
-
-            self.enc_stages.append(enc)  
+            self.enc.add(module=enc, name=f"enc{s}")
 
         # ------------------------------------------------------------------ #
-        # Lightweight upsample head (replaces decoder)
+        # Decoder
         # ------------------------------------------------------------------ #
-        self.head = NOLightweightUpsampleHead(
-            stage_channels=enc_channels,
-            out_channels=head_out_channels,
-            fusion=head_fusion,
-            norm_layer=ln_layer,
-            act_layer=act_layer,
-        )
+        dec_drop_path = [
+            x.item() for x in torch.linspace(0, drop_path, sum(dec_depths))
+        ]
+        self.dec = PointSequential()
+        for s in reversed(range(self.num_stages - 1)):
+            dec_drop_path_ = dec_drop_path[
+                sum(dec_depths[:s]) : sum(dec_depths[: s + 1])
+            ][::-1]
+            dec = PointSequential()
+
+            dec.add(
+                NOFusedGridUnpooling(
+                    in_channels=dec_channels_[s + 1],
+                    skip_channels=enc_channels[s],
+                    out_channels=dec_channels_[s],
+                    norm_layer=bn_layer,
+                    act_layer=act_layer,
+                    enable_no=no_stages[s],
+                    use_skip=use_skip,
+                    fusion=fusion,
+                    learnable_stage_weights=learnable_stage_weights,
+                    universal_no_branch=self.universal_no_branch,
+                    universal_dim=universal_dim,
+                ),
+                name="up",
+            )
+
+            for i in range(dec_depths[s]):
+                dec.add(
+                    Block(
+                        channels=dec_channels_[s],
+                        num_heads=dec_num_head[s],
+                        patch_size=dec_patch_size[s],
+                        mlp_ratio=mlp_ratio,
+                        drop_path=dec_drop_path_[i],
+                        norm_layer=ln_layer,
+                        act_layer=act_layer,
+                        pre_norm=pre_norm,
+                        order_index=i % len(self.order),
+                        cpe_indice_key=f"stage{s}",
+                        enable_flash=enable_flash,
+                        upcast_attention=upcast_attention,
+                        upcast_softmax=upcast_softmax,
+                    ),
+                    name=f"block{i}",
+                )
+            self.dec.add(module=dec, name=f"dec{s}")
 
     def forward(self, data_dict: dict) -> Point:
         point = Point(data_dict)
@@ -868,10 +798,6 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
         point.sparsify()
 
         point = self.embedding(point)
-
-        stage_points = []
-        for stage in self.enc_stages:   
-            point = stage(point)
-            stage_points.append(point)
-
-        return self.head(stage_points)
+        point = self.enc(point)
+        point = self.dec(point)
+        return point
