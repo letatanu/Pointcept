@@ -171,12 +171,12 @@ class QuatRPE(nn.Module):
         xyz = torch.sin(half) * axis                               # (N, 3)
         return torch.cat([w, xyz], dim=1)                          # (N, 4)
 
-    def forward(self, coord: torch.Tensor) -> torch.Tensor:
+    def forward(self, point: Point) -> torch.Tensor:
         """
         coord: (N, 3) float — grid_coord or coord of current stage
         Returns: (N, out_channels)
         """
-        coord_f  = coord.float()
+        coord_f = point.coord.float()
         centroid = coord_f.mean(dim=0, keepdim=True)               # (1, 3)
         delta    = coord_f - centroid                               # (N, 3)
         radius   = delta.norm(dim=1, keepdim=True)                 # (N, 1)
@@ -198,7 +198,27 @@ class QuatRPE(nn.Module):
             out = apply_quat_rotation_to_features(out, quat)
         return out
 
+# ---------------------------------------------------------------------------
+# QuatRPEBlockWrapper (Injects QuatRPE into Block inputs)
+# ---------------------------------------------------------------------------
 
+class QuatRPEBlockWrapper(PointModule):
+    def __init__(self, block: nn.Module, channels: int):
+        super().__init__()
+        self.block = block
+        self.rpe = QuatRPE(channels, num_freqs=8)
+        
+    def forward(self, point: Point) -> Point:
+        # Inject geometry directly into features before attention
+        pos_enc = self.rpe(point).to(point.feat.dtype)
+        point.feat = point.feat + pos_enc
+        
+        # Update sparse feature cache if it exists
+        if hasattr(point, "sparse_conv_feat") and point.sparse_conv_feat is not None:
+            point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
+            
+        return self.block(point)
+    
 def apply_quat_rotation_to_features(feat: torch.Tensor, quat: torch.Tensor) -> torch.Tensor:
     """
     Apply quaternion rotation to feature channels in consecutive pairs.
@@ -446,25 +466,25 @@ class NOGlobalBranch(nn.Module):
         self.norm      = norm_layer(channels)
         self.grid_size = grid_size
         # Relative position encoding → fused into features before FFT
-        self.rel_pos_enc = RelativePositionEncoding(channels)
+        # self.rel_pos_enc = RelativePositionEncoding(channels)
+        self.rel_pos_enc = QuatRPE(channels, num_freqs=8)  # More powerful RPE variant
 
-    def forward(self, feat: torch.Tensor, coord: torch.Tensor) -> torch.Tensor:
+    def forward(self, feat: torch.Tensor, point: Point) -> torch.Tensor:
         """
         Args:
             feat  : (N, C) — already projected to universal_dim by the caller
-            coord : (N, 3) — grid_coord or coord of the current stage
-        Returns:
-            (N, C) — spectral-enriched features, same shape as input
+            point : Point — the full point object for the current stage
         """
         Gx, Gy, Gz  = self.grid_size
         C            = feat.shape[1]
         device, dtype = feat.device, feat.dtype
 
-        # --- 1. Fuse relative position encoding into features ---
-        pos_enc = self.rel_pos_enc(coord).to(dtype)   # (N, C)
-        feat    = feat + pos_enc                       # in-place add, keeps grad
+        # --- 1. Fuse relative position encoding into features ---\
+        pos_enc = self.rel_pos_enc(point).to(dtype)    # Pass full point object
+        feat    = feat + pos_enc                       
 
-        # --- 2. Scatter points onto a dense regular grid ---
+        # --- 2. Scatter points onto a dense regular grid ---\
+        coord = point.grid_coord                       # Use grid_coord for FNO 
         coord_f   = coord.float()
         coord_min = coord_f.min(dim=0).values
         coord_max = coord_f.max(dim=0).values
@@ -553,7 +573,7 @@ class NOFusedGridPooling(PointModule):
             feat_down = self.down_proj(point.feat)
             
             # 2. Extract Global Context via WNO (N_in, universal_dim)
-            global_feat = self.no_branch(feat_down, point.grid_coord)
+            global_feat = self.no_branch(feat_down, point)
 
         # 3. Downsample the backbone point cloud (N_in -> N_out)
         point = self.pool(point)
@@ -742,24 +762,29 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
                 )
 
             for i in range(enc_depths[s]):
+                # Create the standard block
+                base_block = Block(
+                    channels=enc_channels[s],
+                    num_heads=enc_num_head[s],
+                    patch_size=enc_patch_size[s],
+                    mlp_ratio=mlp_ratio,
+                    drop_path=enc_drop_path_[i],
+                    norm_layer=ln_layer,
+                    act_layer=act_layer,
+                    pre_norm=pre_norm,
+                    order_index=i % len(self.order),
+                    cpe_indice_key=f"stage{s}",
+                    enable_flash=enable_flash,
+                    upcast_attention=upcast_attention,
+                    upcast_softmax=upcast_softmax,
+                )
+                
+                # Wrap it to inject QuatRPE
                 enc.add(
-                    Block(
-                        channels=enc_channels[s],
-                        num_heads=enc_num_head[s],
-                        patch_size=enc_patch_size[s],
-                        mlp_ratio=mlp_ratio,
-                        drop_path=enc_drop_path_[i],
-                        norm_layer=ln_layer,
-                        act_layer=act_layer,
-                        pre_norm=pre_norm,
-                        order_index=i % len(self.order),
-                        cpe_indice_key=f"stage{s}",
-                        enable_flash=enable_flash,
-                        upcast_attention=upcast_attention,
-                        upcast_softmax=upcast_softmax,
-                    ),
+                    QuatRPEBlockWrapper(base_block, enc_channels[s]),
                     name=f"block{i}",
                 )
+
 
             self.enc_stages.append(enc)  
 
