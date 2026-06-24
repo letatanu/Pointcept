@@ -26,8 +26,6 @@ names = [
 # Adjust down (e.g. 0.3) if GPU memory allows and detail is needed
 grid_size = 0.5
 
-
-
 model = dict(
     type='DefaultSegmentorV2',
     num_classes=len(names),

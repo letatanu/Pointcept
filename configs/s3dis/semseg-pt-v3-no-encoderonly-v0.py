@@ -2,7 +2,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 21
+batch_size = 7
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -11,7 +11,7 @@ enable_amp = True
 amp_dtype = "bfloat16"
 clip_grad = 1.0
 model = dict(
-    type='DefaultSegmentorV2',
+    type='DefaultSegmentorV3',
     num_classes=13,
     backbone_out_channels=64,          # must match head_out_channels
     backbone=dict(
@@ -39,7 +39,7 @@ model = dict(
         NO_type='WNO',
         pool_reduce='max',
         head_out_channels=64,
-        head_fusion='sum',             # sum is cheaper; try concat if mIoU plateaus
+        head_fusion='concat',             # sum is cheaper; try concat if mIoU plateaus
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),

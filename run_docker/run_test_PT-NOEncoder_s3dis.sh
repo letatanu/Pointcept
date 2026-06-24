@@ -11,7 +11,7 @@ OMP_NUM_THREADS=4
 DOCKER_IMAGE="letatanu/pointcept1"
 
 echo "Starting S3DIS Training on Devices: $DEVICES"
-EXP_NAME="semseg-pt-v3-no-encoderonly-v0_02"
+EXP_NAME="semseg-pt-v3-no-encoderonly-v0_06"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
 echo "Model Name: $MODEL_NAME"

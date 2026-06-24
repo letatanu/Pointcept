@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="0,1,2,3,4,5,6"
+DEVICES="1,2,3,4,5,6,7"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -10,12 +10,12 @@ OMP_NUM_THREADS=4
 # Ensure this matches your docker image name
 DOCKER_IMAGE="letatanu/pointcept1"
 
-echo "Starting ScanNet Training on Devices: $DEVICES"
+echo "Starting SemanticKITTI Training on Devices: $DEVICES"
 
 EXP_NAME="semseg-pt-v3-no-encoderonly-v0_01"
 CONFIG_PATH="semseg-pt-v3-no-encoderonly-v0"
 ## --------------------------------------------------------- ##
-DATASET="scannet"
+DATASET="semantic_kitti"
 echo "Devices: $DEVICES"
 
 docker run --ulimit nofile=1048576:1048576 --ipc=host \

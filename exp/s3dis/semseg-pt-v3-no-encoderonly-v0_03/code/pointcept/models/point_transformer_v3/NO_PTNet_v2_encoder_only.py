@@ -10,8 +10,9 @@ import torch_scatter
 from addict import Dict
 from functools import partial
 
-from pointcept.models.builder import MODELS
+from pointcept.models.builder import MODELS, build_model
 from pointcept.models.utils.structure import Point
+from pointcept.models.losses import build_criteria
 from pointcept.models.modules import PointModule, PointSequential
 
 from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
@@ -812,3 +813,67 @@ class PointTransformerV3_NO_EncoderOnly(PointModule):
             stage_points.append(point)
 
         return self.head(stage_points)
+    
+    
+@MODELS.register_module()
+class DefaultSegmentorV3(nn.Module):
+    def __init__(
+        self,
+        num_classes,
+        backbone_out_channels,
+        backbone=None,
+        criteria=None,
+        freeze_backbone=False,
+    ):
+        super().__init__()
+        self.seg_head = (
+            nn.Linear(backbone_out_channels, num_classes)
+            if num_classes > 0
+            else nn.Identity()
+        )
+        self.backbone = build_model(backbone)
+        self.criteria = build_criteria(criteria)
+        self.freeze_backbone = freeze_backbone
+        if self.freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
+    def forward(self, input_dict, return_point=False):
+        point = Point(input_dict)
+        if self.freeze_backbone and not self.use_lora:
+            with torch.no_grad():
+                point = self.backbone(point)
+        else:
+            point = self.backbone(point)
+
+        # Collect OPTNet-style RPE aux loss if available
+        aux_rpe_loss = getattr(point, "aux_rpe_loss", None)
+
+        if isinstance(point, Point):
+            while "pooling_parent" in point.keys():
+                assert "pooling_inverse" in point.keys()
+                parent = point.pop("pooling_parent")
+                inverse = point.pop("pooling_inverse")
+                parent.feat = torch.cat([parent.feat, point.feat[inverse]], dim=-1)
+                point = parent
+            feat = point.feat
+        else:
+            feat = point
+
+        seg_logits = self.seg_head(feat)
+        return_dict = dict()
+        if return_point:
+            return_dict["point"] = point
+
+        if self.training:
+            loss = self.criteria(seg_logits, input_dict["segment"])
+            if aux_rpe_loss is not None:
+                loss = loss + 0.5 * aux_rpe_loss
+            return_dict["loss"] = loss
+        elif "segment" in input_dict.keys():
+            loss = self.criteria(seg_logits, input_dict["segment"])
+            return_dict["loss"] = loss
+            return_dict["seg_logits"] = seg_logits
+        else:
+            return_dict["seg_logits"] = seg_logits
+        return return_dict
