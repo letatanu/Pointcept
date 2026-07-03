@@ -1,4 +1,4 @@
-weight = None
+weight = 'exp/dales/semseg-pt-v3m1-0-base/model/model_best.pth'
 resume = False
 evaluate = True
 test_only = False

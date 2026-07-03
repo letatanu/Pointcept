@@ -2,7 +2,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 7
+batch_size = 21
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -23,7 +23,7 @@ model = dict(
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
-        mlp_ratio=4,
+        mlp_ratio=8,
         drop_path=0.2,
         pre_norm=True,
         shuffle_orders=True,
@@ -31,15 +31,15 @@ model = dict(
         upcast_attention=False,
         upcast_softmax=False,
         no_stages=(True, True, True, True),
-        fno_modes=4,
+        fno_modes=8,
         base_grid_size=(64, 64, 64),
         fusion='concat',
         share_no_branch=True,
-        universal_dim=32,
+        universal_dim=64,
         NO_type='WNO',
         pool_reduce='max',
         head_out_channels=64,
-        head_fusion='concat',             # sum is cheaper; try concat if mIoU plateaus
+        head_fusion='sum',             # sum is cheaper; try concat if mIoU plateaus
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),

@@ -14,8 +14,8 @@ names = ["Building-Damage", "Building-No-Damage",  "Road", "Tree", "Background"]
 grid_size = 0.22
 model = dict(
     type='DefaultSegmentorV2',
-    num_classes=len(names),
-    backbone_out_channels=64,          # must match head_out_channels
+    num_classes=13,
+    backbone_out_channels=64,
     backbone=dict(
         type='PT-v3m1-NO-EncoderOnly',
         in_channels=6,
@@ -37,17 +37,19 @@ model = dict(
         base_grid_size=(64, 64, 64),
         fusion='concat',
         share_no_branch=True,
-        universal_dim=32,
+        universal_dim=64,
         NO_type='WNO',
         pool_reduce='max',
         head_out_channels=64,
-        head_fusion='sum',             # sum is cheaper; try concat if mIoU plateaus
-    ),
+        head_fusion='sum'),
     criteria=[
-        dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
-        dict(type="LovaszLoss", mode="multiclass", loss_weight=1.0, ignore_index=-1),
-    ],
-)
+        dict(type='CrossEntropyLoss', loss_weight=1.0, ignore_index=-1),
+        dict(
+            type='LovaszLoss',
+            mode='multiclass',
+            loss_weight=1.0,
+            ignore_index=-1)
+    ])
 
 epoch = 3000
 eval_epoch = 100

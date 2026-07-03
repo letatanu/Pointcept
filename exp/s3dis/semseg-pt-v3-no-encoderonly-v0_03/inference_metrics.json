@@ -1,0 +1,9 @@
+{
+  "latency_mean_ms": 173.85601794347167,
+  "latency_std_ms": 2.8872894680138343,
+  "latency_median_ms": 173.2974350452423,
+  "peak_memory_mb": 1582.783203125,
+  "num_warmup": 10,
+  "num_runs": 50,
+  "checkpoint": "exp/s3dis/semseg-pt-v3-no-encoderonly-v0_03/model/model_best.pth"
+}
