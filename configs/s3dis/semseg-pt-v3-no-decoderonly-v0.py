@@ -1,6 +1,6 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 28
+batch_size = 14
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -18,7 +18,8 @@ model = dict(
         in_channels=6,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
-        enc_depths=(2, 2, 2, 2, 2),
+        enc_depths=(2,2,2,2,2), #(coarse→fine order)
+        dec_depths=(6,2,4,4), #(coarse→fine order)
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
@@ -37,7 +38,7 @@ model = dict(
         universal_dim=64,
         NO_type="WNO",
         pool_reduce="max",
-        head_out_channels=64,   # FIX: added, matches backbone_out_channels
+        head_out_channels=64,  
         head_fusion="sum",
     ),
     criteria=[

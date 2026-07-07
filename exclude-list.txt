@@ -1,0 +1,5 @@
+*.log 
+exp
+data
+.vscode
+.github
