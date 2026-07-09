@@ -88,54 +88,64 @@ class SerializedLocalMLP(PointModule):
             "Run point.serialization() before SerializedLocalMLP"
 
         K    = self.patch_size
-        feat = point.feat                   # (N, C)
+        feat = point.feat          # (N, C)
         N, C = feat.shape
+        device = feat.device
 
-        offset   = point.offset             # (B,) cumulative
-        bincount = offset2bincount(offset)  # (B,) points per scene
+        offset   = point.offset                 # (B,) cumulative
+        bincount = offset2bincount(offset)      # (B,) points per scene
+        B        = len(bincount)
 
-        # pad each scene independently so total is divisible by K
-        bincount_pad = (
-            torch.div(bincount + K - 1, K, rounding_mode="trunc") * K
-        )
-        # scenes smaller than K: no padding needed
-        bincount_pad = torch.where(bincount > K, bincount_pad, bincount)
+        # Global serialized order/inverse (over all N points)
+        global_order   = point.serialized_order[self.order_index]    # (N,)
+        global_inverse = point.serialized_inverse[self.order_index]  # (N,)
 
-        _offset     = nn.functional.pad(offset, (1, 0))          # (B+1,)
-        _offset_pad = nn.functional.pad(
-            torch.cumsum(bincount_pad, dim=0), (1, 0)
-        )                                                          # (B+1,)
-        N_pad = _offset_pad[-1].item()
+        _offset = nn.functional.pad(offset, (1, 0))  # (B+1,) with leading 0
 
-        # build pad (N_pad -> orig) and unpad (N -> padded position) indices
-        pad   = torch.arange(N_pad, device=feat.device, dtype=torch.long)
-        unpad = torch.arange(N,     device=feat.device, dtype=torch.long)
+        # Build padded order list and track where each orig point lands
+        pad_list   = []   # will be concatenated → (N_pad,)  orig-space indices
+        unpad_pos  = torch.empty(N, dtype=torch.long, device=device)
 
-        for i in range(len(offset)):
-            n_i   = bincount[i].item()
-            np_i  = bincount_pad[i].item()
-            src_s = _offset[i].item()
-            src_e = _offset[i + 1].item()
-            dst_s = _offset_pad[i].item()
-            dst_e = _offset_pad[i + 1].item()
+        cursor = 0  # current write position in padded buffer
+        for i in range(B):
+            src_s = int(_offset[i].item())
+            src_e = int(_offset[i + 1].item())
+            n_i   = src_e - src_s
 
-            # shift unpad indices to their padded position
-            unpad[src_s:src_e] += dst_s - src_s
+            # local order for this scene: positions within [src_s, src_e)
+            # global_order gives orig indices; filter to this scene's range
+            # Use the serialized order but restrict to this scene's points
+            scene_order_mask = (global_order >= src_s) & (global_order < src_e)
+            scene_order      = global_order[scene_order_mask]  # (n_i,) orig indices
 
-            if n_i != np_i:
-                # repeat last patch to fill the remainder
-                pad[dst_e - K + (n_i % K): dst_e] = \
-                    pad[dst_e - 2*K + (n_i % K): dst_e - K]
+            # pad to next multiple of K (min K)
+            np_i = max(((n_i + K - 1) // K) * K, K)
+            if n_i < np_i:
+                n_pad  = np_i - n_i
+                # tile from start of scene_order
+                extra  = scene_order[torch.arange(n_pad, device=device) % n_i]
+                scene_order_padded = torch.cat([scene_order, extra])
+            else:
+                scene_order_padded = scene_order
 
-            # shift pad indices back to original space
-            pad[dst_s:dst_e] -= dst_s - src_s
+            # record where each orig point in this scene lands in the padded buffer
+            # scene_order[:n_i] are the orig indices in sorted order
+            unpad_pos[scene_order] = torch.arange(n_i, device=device) + cursor
 
-        order   = point.serialized_order[self.order_index][pad]      # (N_pad,)
-        inverse = unpad[point.serialized_inverse[self.order_index]]  # (N,)
+            pad_list.append(scene_order_padded)
+            cursor += np_i
 
-        feat_ord  = feat[order].reshape(-1, K, C)    # (W, K, C)
+        pad_tensor = torch.cat(pad_list, dim=0)  # (N_pad,)
+
+        # inverse: for each orig point, its position in the padded buffer
+        # We want: given padded position p, agg_padded[unpad_pos[orig]] = agg_padded[p]
+        # Actually we need: agg_padded indexed by orig point
+        # unpad_pos[i] = padded-buffer position of orig point i
+        inverse = unpad_pos  # (N,)  — maps orig → padded position
+
+        feat_ord  = feat[pad_tensor].reshape(-1, K, C)           # (W, K, C)
         coord     = point.coord.float()
-        coord_ord = coord[order].reshape(-1, K, 3)   # (W, K, 3)
+        coord_ord = coord[pad_tensor].reshape(-1, K, 3)           # (W, K, 3)
 
         centroid_coord = coord_ord.mean(dim=1, keepdim=True)
         delta_xyz      = coord_ord - centroid_coord
@@ -143,7 +153,7 @@ class SerializedLocalMLP(PointModule):
         has_color = self.use_rgb and "color" in point.keys()
         if has_color:
             color          = point.color.float()
-            color_ord      = color[order].reshape(-1, K, 3)
+            color_ord      = color[pad_tensor].reshape(-1, K, 3)
             centroid_color = color_ord.mean(dim=1, keepdim=True)
             delta_rgb      = color_ord - centroid_color
             local_input    = torch.cat([delta_xyz, delta_rgb, feat_ord], dim=-1)
@@ -152,10 +162,10 @@ class SerializedLocalMLP(PointModule):
             local_input    = torch.cat([delta_xyz, feat_ord], dim=-1)
             mlp_out        = self.mlp_geo(local_input)
 
-        # max-pool per window, broadcast back
-        agg_win    = mlp_out.max(dim=1).values                              # (W, C)
-        agg_padded = agg_win.unsqueeze(1).expand(-1, K, -1).reshape(-1, C) # (N_pad, C)
-        agg        = agg_padded[inverse]                                    # (N, C)
+        # max-pool per window, broadcast back to N_pad, then gather to N
+        agg_win    = mlp_out.max(dim=1).values                               # (W, C)
+        agg_padded = agg_win.unsqueeze(1).expand(-1, K, -1).reshape(-1, C)  # (N_pad, C)
+        agg        = agg_padded[inverse]                                     # (N, C)
 
         point.feat = self.out_norm(feat + agg)
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
