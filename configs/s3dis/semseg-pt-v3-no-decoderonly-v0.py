@@ -1,6 +1,6 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 14
+batch_size = 12
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -36,7 +36,7 @@ model = dict(
         fusion="concat",
         share_no_branch=True,
         universal_dim=64,
-        NO_type="WNO",
+        NO_type="MLP",
         pool_reduce="max",
         head_out_channels=64,  
         head_fusion="sum",

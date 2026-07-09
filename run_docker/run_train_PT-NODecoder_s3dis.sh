@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="1,2,3,4,5,6,7"
+DEVICES="2,3,4,5,6,7"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -12,7 +12,7 @@ DOCKER_IMAGE="letatanu/pointcept1"
 
 echo "Starting S3DIS Training on Devices: $DEVICES"
 
-EXP_NAME="semseg-pt-v3-no-decoderonly-v0_07"
+EXP_NAME="semseg-pt-v3-no-decoderonly-v0_11"
 CONFIG_PATH="semseg-pt-v3-no-decoderonly-v0"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
