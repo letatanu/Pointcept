@@ -101,7 +101,7 @@ class SerializedLocalMLP(PointModule):
         global_inverse = point.serialized_inverse[self.order_index]  # (N,) maps orig-idx -> order-pos
 
         pad_list  = []
-        unpad_pos = torch.empty(N, dtype=torch.long, device=device)
+        unpad_pos = torch.zeros(N, dtype=torch.long, device=device)
 
         cursor = 0
         for i in range(B):
@@ -130,10 +130,16 @@ class SerializedLocalMLP(PointModule):
             cursor += np_i
 
         pad_tensor = torch.cat(pad_list, dim=0)  # (N_pad,)
-
-        feat_ord  = feat[pad_tensor].reshape(-1, K, C)
+        if pad_tensor.numel() == 0:
+            # No valid windows — return point unchanged
+            point.feat = self.out_norm(feat + torch.zeros_like(feat))
+            point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
+            return point
+        
         coord     = point.coord.float()
+        feat_ord  = feat[pad_tensor].reshape(-1, K, C)
         coord_ord = coord[pad_tensor].reshape(-1, K, 3)
+
 
         centroid_coord = coord_ord.mean(dim=1, keepdim=True)
         delta_xyz      = coord_ord - centroid_coord
@@ -643,12 +649,19 @@ class MaskedNOFusedGridUnpooling(PointModule):
         point_fine: Point,
         prev_mask_ids=None,
     ):
+        
         inv     = point_coarse.pooling_inverse
         feat_up = self.up_proj(point_coarse.feat)[inv]
         point_fine.feat = feat_up
         point_fine.sparse_conv_feat = point_fine.sparse_conv_feat.replace_feature(feat_up)
 
-        # CHANGED: serialization-window local MLP (no kNN)
+        # In MaskedNOFusedGridUnpooling.forward, before local_mlp call:
+        if "serialized_order" not in point_fine.keys():
+            point_fine.serialization(
+                order=point_fine.order if hasattr(point_fine, "order") else ["z"],
+                shuffle_orders=False,
+            )
+            
         point_fine = self.local_mlp(point_fine)
 
         if not self.enable_no:
