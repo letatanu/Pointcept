@@ -62,20 +62,11 @@ class SerializedLocalMLP(PointModule):
         self.use_rgb     = use_rgb
         self.channels    = channels
 
-        # BUILD TWO mlps: one with rgb, one without
-        # select in forward based on actual data availability
-        in_dim_rgb  = 3 + 3 + channels   # delta_xyz + delta_rgb + feat
-        in_dim_geo  = 3 + channels        # delta_xyz + feat only
+        # Only create the MLP size we actually need
+        in_dim = (3 + 3 + channels) if use_rgb else (3 + channels)
 
-        self.mlp_rgb = nn.Sequential(
-            nn.Linear(in_dim_rgb, channels),
-            nn.LayerNorm(channels), nn.GELU(),
-            nn.Linear(channels, channels),
-            nn.LayerNorm(channels), nn.GELU(),
-            nn.Linear(channels, channels),
-        )
-        self.mlp_geo = nn.Sequential(
-            nn.Linear(in_dim_geo, channels),
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, channels),
             nn.LayerNorm(channels), nn.GELU(),
             nn.Linear(channels, channels),
             nn.LayerNorm(channels), nn.GELU(),
@@ -99,7 +90,7 @@ class SerializedLocalMLP(PointModule):
 
         global_inverse = point.serialized_inverse[self.order_index]  # (N,) orig-idx -> order-pos
 
-        pad_list       = []   # list of orig-index tensors (global) per scene
+        pad_list       = []   
         unpad_pos      = torch.zeros(N, dtype=torch.long, device=device)
         cursor         = 0
 
@@ -110,16 +101,10 @@ class SerializedLocalMLP(PointModule):
             if n_i == 0:
                 continue
 
-            # Order positions for THIS scene's points in the global SFC
-            order_pos_scene = global_inverse[src_s:src_e]  # (n_i,) values in [0, N)
+            order_pos_scene = global_inverse[src_s:src_e]  
+            sorted_ranks = order_pos_scene.argsort()       
+            scene_order = torch.arange(src_s, src_e, device=device)[sorted_ranks]  
 
-            # Sort by order position to get SFC order within this scene
-            sorted_ranks = order_pos_scene.argsort()       # (n_i,) local indices sorted by SFC pos
-            # sorted_ranks[j] is the local index (within scene) of the j-th point in SFC order
-            # Convert to global orig-indices:
-            scene_order = torch.arange(src_s, src_e, device=device)[sorted_ranks]  # (n_i,) global orig-idx
-
-            # Pad to multiple of K
             np_i  = max(((n_i + K - 1) // K) * K, K)
             n_pad = np_i - n_i
             if n_pad > 0:
@@ -128,7 +113,6 @@ class SerializedLocalMLP(PointModule):
             else:
                 scene_order_padded = scene_order
 
-            # unpad_pos maps each global orig-index to its position in the flat padded buffer
             unpad_pos[scene_order] = torch.arange(n_i, device=device) + cursor
 
             pad_list.append(scene_order_padded)
@@ -139,7 +123,7 @@ class SerializedLocalMLP(PointModule):
             point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
             return point
 
-        pad_tensor = torch.cat(pad_list, dim=0)  # (N_pad,) global orig-indices
+        pad_tensor = torch.cat(pad_list, dim=0)  
 
         coord      = point.coord.float()
         feat_ord   = feat[pad_tensor].reshape(-1, K, C)
@@ -147,17 +131,25 @@ class SerializedLocalMLP(PointModule):
 
         centroid_coord = coord_ord.mean(dim=1, keepdim=True)
         delta_xyz      = (coord_ord - centroid_coord).to(feat.dtype)
+        
+        # Check if we EXPECT color and if we HAVE color
+        expected_color = self.use_rgb
+        has_color = "color" in point.keys()
 
-        has_color = self.use_rgb and "color" in point.keys()
-        if has_color:
-            color_ord      = point.color.float()[pad_tensor].reshape(-1, K, 3)
-            centroid_color = color_ord.mean(dim=1, keepdim=True)
-            delta_rgb      = (color_ord - centroid_color).to(feat.dtype)
-            local_input    = torch.cat([delta_xyz, delta_rgb, feat_ord], dim=-1).contiguous()
-            mlp_out        = self.mlp_rgb(local_input)
+        if expected_color:
+            if has_color:
+                color_ord      = point.color.float()[pad_tensor].reshape(-1, K, 3)
+                centroid_color = color_ord.mean(dim=1, keepdim=True)
+                delta_rgb      = (color_ord - centroid_color).to(feat.dtype)
+            else:
+                # If the MLP expects color but pooling dropped it, pad with zeros
+                delta_rgb = torch.zeros((feat_ord.shape[0], K, 3), dtype=feat.dtype, device=device)
+                
+            local_input = torch.cat([delta_xyz, delta_rgb, feat_ord], dim=-1).contiguous()
         else:
-            local_input    = torch.cat([delta_xyz, feat_ord], dim=-1).contiguous()
-            mlp_out        = self.mlp_geo(local_input)
+            local_input = torch.cat([delta_xyz, feat_ord], dim=-1).contiguous()
+
+        mlp_out = self.mlp(local_input)
 
         agg_win    = mlp_out.max(dim=1).values
         agg_padded = agg_win.unsqueeze(1).expand(-1, K, -1).reshape(-1, C)
@@ -615,8 +607,8 @@ class MaskedNOFusedGridUnpooling(PointModule):
         universal_no_branch=None,
         universal_dim=64,
         num_queries=100,
-        patch_size=48,       # CHANGED: was k_local=16
-        order_index=0,       # CHANGED: was implicit
+        patch_size=48,       
+        order_index=0,
         use_rgb=True,
     ):
         super().__init__()
@@ -625,7 +617,7 @@ class MaskedNOFusedGridUnpooling(PointModule):
         self.up_proj     = nn.Linear(in_channels, out_channels)
         self.num_queries = num_queries
 
-        # CHANGED: SerializedLocalMLP instead of PointNetPPLocalAgg (no kNN)
+        # SerializedLocalMLP 
         self.local_mlp = SerializedLocalMLP(
             channels=out_channels,
             patch_size=patch_size,
@@ -659,14 +651,12 @@ class MaskedNOFusedGridUnpooling(PointModule):
         point_fine.feat = feat_up
         point_fine.sparse_conv_feat = point_fine.sparse_conv_feat.replace_feature(feat_up)
 
-        # In MaskedNOFusedGridUnpooling.forward, before local_mlp call:
-        if "serialized_order" not in point_fine.keys():
-            point_fine.serialization(
-                order=point_fine.order if hasattr(point_fine, "order") else ["z"],
-                shuffle_orders=False,
-            )
-            
+        point_fine.serialization(
+            order=point_fine.order if hasattr(point_fine, "order") else ["z"],
+            shuffle_orders=False,
+        )
         point_fine = self.local_mlp(point_fine)
+            
 
         if not self.enable_no:
             return point_fine, None
@@ -685,6 +675,12 @@ class MaskedNOFusedGridUnpooling(PointModule):
             if pts_mask.numel() < 4:
                 continue
             mini_feat  = feat_down[pts_mask]
+            
+            # --- ADD THIS LINE ---
+            # Inject the query into the features so it can learn a regional prior.
+            # This makes Q fully differentiable and gives it a real purpose!
+            mini_feat = mini_feat + Q[q_idx].unsqueeze(0)
+            
             mini_coord = point_fine.grid_coord[pts_mask]
             mini_batch = point_fine.batch[pts_mask]
             mini_offset = torch.zeros(
@@ -955,7 +951,9 @@ class PointTransformerV3_NO_DecoderOnly(PointModule):
         # 4. Decode: coarse -> fine
         prev_mask_ids = None
         for i, (unpool, blocks) in enumerate(zip(self.dec_unpool, self.dec_blocks)):
-            fine_point = scaffold[-(i + 2)]
+            # Change -(i + 2) to -(i + 1) to fetch the correct fine scale
+            fine_point = scaffold[-(i + 1)]
+            
             point, prev_mask_ids = unpool(point, fine_point, prev_mask_ids)
             point = blocks(point)
 

@@ -1,6 +1,6 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 12
+batch_size = 6
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -32,7 +32,7 @@ model = dict(
         upcast_softmax=False,
         no_stages=(True, True, True, True),
         fno_modes=8,
-        base_grid_size=(64, 64, 64),
+        base_grid_size=(32,32,32),
         fusion="concat",
         share_no_branch=True,
         universal_dim=64,
