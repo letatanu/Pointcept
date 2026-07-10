@@ -97,24 +97,29 @@ class SerializedLocalMLP(PointModule):
         B        = len(bincount)
         _offset  = nn.functional.pad(offset, (1, 0))  # (B+1,)
 
-        global_order   = point.serialized_order[self.order_index]    # (N,) maps order-pos -> orig-idx
-        global_inverse = point.serialized_inverse[self.order_index]  # (N,) maps orig-idx -> order-pos
+        global_inverse = point.serialized_inverse[self.order_index]  # (N,) orig-idx -> order-pos
 
-        pad_list  = []
-        unpad_pos = torch.zeros(N, dtype=torch.long, device=device)
+        pad_list       = []   # list of orig-index tensors (global) per scene
+        unpad_pos      = torch.zeros(N, dtype=torch.long, device=device)
+        cursor         = 0
 
-        cursor = 0
         for i in range(B):
             src_s = int(_offset[i].item())
             src_e = int(_offset[i + 1].item())
             n_i   = src_e - src_s
+            if n_i == 0:
+                continue
 
-            # order positions of this scene's points (in serialized order)
-            order_positions = global_inverse[src_s:src_e]        # (n_i,) positions in order
-            order_positions_sorted, _ = order_positions.sort()   # sort so windows are contiguous
-            scene_order = global_order[order_positions_sorted]   # (n_i,) orig-indices in SFC order
+            # Order positions for THIS scene's points in the global SFC
+            order_pos_scene = global_inverse[src_s:src_e]  # (n_i,) values in [0, N)
 
-            # pad to next multiple of K (min K)
+            # Sort by order position to get SFC order within this scene
+            sorted_ranks = order_pos_scene.argsort()       # (n_i,) local indices sorted by SFC pos
+            # sorted_ranks[j] is the local index (within scene) of the j-th point in SFC order
+            # Convert to global orig-indices:
+            scene_order = torch.arange(src_s, src_e, device=device)[sorted_ranks]  # (n_i,) global orig-idx
+
+            # Pad to multiple of K
             np_i  = max(((n_i + K - 1) // K) * K, K)
             n_pad = np_i - n_i
             if n_pad > 0:
@@ -123,41 +128,40 @@ class SerializedLocalMLP(PointModule):
             else:
                 scene_order_padded = scene_order
 
-            # map each orig-space point to its position in the padded buffer
+            # unpad_pos maps each global orig-index to its position in the flat padded buffer
             unpad_pos[scene_order] = torch.arange(n_i, device=device) + cursor
 
             pad_list.append(scene_order_padded)
             cursor += np_i
 
-        pad_tensor = torch.cat(pad_list, dim=0)  # (N_pad,)
-        if pad_tensor.numel() == 0:
-            # No valid windows — return point unchanged
-            point.feat = self.out_norm(feat + torch.zeros_like(feat))
+        if not pad_list:
+            point.feat = self.out_norm(feat)
             point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
             return point
-        
-        coord     = point.coord.float()
-        feat_ord  = feat[pad_tensor].reshape(-1, K, C)
-        coord_ord = coord[pad_tensor].reshape(-1, K, 3)
 
+        pad_tensor = torch.cat(pad_list, dim=0)  # (N_pad,) global orig-indices
+
+        coord      = point.coord.float()
+        feat_ord   = feat[pad_tensor].reshape(-1, K, C)
+        coord_ord  = coord[pad_tensor].reshape(-1, K, 3)
 
         centroid_coord = coord_ord.mean(dim=1, keepdim=True)
-        delta_xyz      = coord_ord - centroid_coord
+        delta_xyz      = (coord_ord - centroid_coord).to(feat.dtype)
 
         has_color = self.use_rgb and "color" in point.keys()
         if has_color:
             color_ord      = point.color.float()[pad_tensor].reshape(-1, K, 3)
             centroid_color = color_ord.mean(dim=1, keepdim=True)
-            delta_rgb      = color_ord - centroid_color
-            local_input    = torch.cat([delta_xyz, delta_rgb, feat_ord], dim=-1)
+            delta_rgb      = (color_ord - centroid_color).to(feat.dtype)
+            local_input    = torch.cat([delta_xyz, delta_rgb, feat_ord], dim=-1).contiguous()
             mlp_out        = self.mlp_rgb(local_input)
         else:
-            local_input    = torch.cat([delta_xyz, feat_ord], dim=-1)
+            local_input    = torch.cat([delta_xyz, feat_ord], dim=-1).contiguous()
             mlp_out        = self.mlp_geo(local_input)
 
-        agg_win    = mlp_out.max(dim=1).values                               # (W, C)
-        agg_padded = agg_win.unsqueeze(1).expand(-1, K, -1).reshape(-1, C)  # (N_pad, C)
-        agg        = agg_padded[unpad_pos]                                   # (N, C)
+        agg_win    = mlp_out.max(dim=1).values
+        agg_padded = agg_win.unsqueeze(1).expand(-1, K, -1).reshape(-1, C)
+        agg        = agg_padded[unpad_pos]
 
         point.feat = self.out_norm(feat + agg)
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
@@ -651,7 +655,7 @@ class MaskedNOFusedGridUnpooling(PointModule):
     ):
         
         inv     = point_coarse.pooling_inverse
-        feat_up = self.up_proj(point_coarse.feat)[inv]
+        feat_up = self.up_proj(point_coarse.feat)[inv].contiguous()
         point_fine.feat = feat_up
         point_fine.sparse_conv_feat = point_fine.sparse_conv_feat.replace_feature(feat_up)
 
