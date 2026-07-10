@@ -92,44 +92,38 @@ class SerializedLocalMLP(PointModule):
         N, C = feat.shape
         device = feat.device
 
-        offset   = point.offset                 # (B,) cumulative
-        bincount = offset2bincount(offset)      # (B,) points per scene
+        offset   = point.offset
+        bincount = offset2bincount(offset)
         B        = len(bincount)
+        _offset  = nn.functional.pad(offset, (1, 0))  # (B+1,)
 
-        # Global serialized order/inverse (over all N points)
-        global_order   = point.serialized_order[self.order_index]    # (N,)
-        global_inverse = point.serialized_inverse[self.order_index]  # (N,)
+        global_order   = point.serialized_order[self.order_index]    # (N,) maps order-pos -> orig-idx
+        global_inverse = point.serialized_inverse[self.order_index]  # (N,) maps orig-idx -> order-pos
 
-        _offset = nn.functional.pad(offset, (1, 0))  # (B+1,) with leading 0
+        pad_list  = []
+        unpad_pos = torch.empty(N, dtype=torch.long, device=device)
 
-        # Build padded order list and track where each orig point lands
-        pad_list   = []   # will be concatenated → (N_pad,)  orig-space indices
-        unpad_pos  = torch.empty(N, dtype=torch.long, device=device)
-
-        cursor = 0  # current write position in padded buffer
+        cursor = 0
         for i in range(B):
             src_s = int(_offset[i].item())
             src_e = int(_offset[i + 1].item())
             n_i   = src_e - src_s
 
-            # local order for this scene: positions within [src_s, src_e)
-            # global_order gives orig indices; filter to this scene's range
-            # Use the serialized order but restrict to this scene's points
-            scene_order_mask = (global_order >= src_s) & (global_order < src_e)
-            scene_order      = global_order[scene_order_mask]  # (n_i,) orig indices
+            # order positions of this scene's points (in serialized order)
+            order_positions = global_inverse[src_s:src_e]        # (n_i,) positions in order
+            order_positions_sorted, _ = order_positions.sort()   # sort so windows are contiguous
+            scene_order = global_order[order_positions_sorted]   # (n_i,) orig-indices in SFC order
 
             # pad to next multiple of K (min K)
-            np_i = max(((n_i + K - 1) // K) * K, K)
-            if n_i < np_i:
-                n_pad  = np_i - n_i
-                # tile from start of scene_order
-                extra  = scene_order[torch.arange(n_pad, device=device) % n_i]
+            np_i  = max(((n_i + K - 1) // K) * K, K)
+            n_pad = np_i - n_i
+            if n_pad > 0:
+                extra = scene_order[torch.arange(n_pad, device=device) % n_i]
                 scene_order_padded = torch.cat([scene_order, extra])
             else:
                 scene_order_padded = scene_order
 
-            # record where each orig point in this scene lands in the padded buffer
-            # scene_order[:n_i] are the orig indices in sorted order
+            # map each orig-space point to its position in the padded buffer
             unpad_pos[scene_order] = torch.arange(n_i, device=device) + cursor
 
             pad_list.append(scene_order_padded)
@@ -137,23 +131,16 @@ class SerializedLocalMLP(PointModule):
 
         pad_tensor = torch.cat(pad_list, dim=0)  # (N_pad,)
 
-        # inverse: for each orig point, its position in the padded buffer
-        # We want: given padded position p, agg_padded[unpad_pos[orig]] = agg_padded[p]
-        # Actually we need: agg_padded indexed by orig point
-        # unpad_pos[i] = padded-buffer position of orig point i
-        inverse = unpad_pos  # (N,)  — maps orig → padded position
-
-        feat_ord  = feat[pad_tensor].reshape(-1, K, C)           # (W, K, C)
+        feat_ord  = feat[pad_tensor].reshape(-1, K, C)
         coord     = point.coord.float()
-        coord_ord = coord[pad_tensor].reshape(-1, K, 3)           # (W, K, 3)
+        coord_ord = coord[pad_tensor].reshape(-1, K, 3)
 
         centroid_coord = coord_ord.mean(dim=1, keepdim=True)
         delta_xyz      = coord_ord - centroid_coord
 
         has_color = self.use_rgb and "color" in point.keys()
         if has_color:
-            color          = point.color.float()
-            color_ord      = color[pad_tensor].reshape(-1, K, 3)
+            color_ord      = point.color.float()[pad_tensor].reshape(-1, K, 3)
             centroid_color = color_ord.mean(dim=1, keepdim=True)
             delta_rgb      = color_ord - centroid_color
             local_input    = torch.cat([delta_xyz, delta_rgb, feat_ord], dim=-1)
@@ -162,15 +149,13 @@ class SerializedLocalMLP(PointModule):
             local_input    = torch.cat([delta_xyz, feat_ord], dim=-1)
             mlp_out        = self.mlp_geo(local_input)
 
-        # max-pool per window, broadcast back to N_pad, then gather to N
         agg_win    = mlp_out.max(dim=1).values                               # (W, C)
         agg_padded = agg_win.unsqueeze(1).expand(-1, K, -1).reshape(-1, C)  # (N_pad, C)
-        agg        = agg_padded[inverse]                                     # (N, C)
+        agg        = agg_padded[unpad_pos]                                   # (N, C)
 
         point.feat = self.out_norm(feat + agg)
         point.sparse_conv_feat = point.sparse_conv_feat.replace_feature(point.feat)
         return point
-
 
 class PointNetPPEncoderStage(PointModule):
     """One encoder stage: GridPooling (traceable) + SerializedLocalMLP."""
