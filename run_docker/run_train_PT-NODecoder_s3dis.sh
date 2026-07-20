@@ -12,7 +12,7 @@ DOCKER_IMAGE="letatanu/pointcept1"
 
 echo "Starting S3DIS Training on Devices: $DEVICES"
 
-EXP_NAME="semseg-pt-v3-no-decoderonly-v0_17"
+EXP_NAME="semseg-pt-v3-no-decoderonly-v0_18"
 CONFIG_PATH="semseg-pt-v3-no-decoderonly-v0"
 ## --------------------------------------------------------- ##
 DATASET="s3dis"
