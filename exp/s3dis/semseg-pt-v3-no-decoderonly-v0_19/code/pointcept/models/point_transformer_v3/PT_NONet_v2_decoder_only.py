@@ -490,7 +490,6 @@ class OrderAwareFusedGridUnpooling(PointModule):
                 # global WNO features are useful.
                 nn.init.zeros_(self.gate_mlp[-1].weight)
                 nn.init.constant_(self.gate_mlp[-1].bias, -4.0)
-                
             elif fusion == "concat":
                 self.proj_concat = nn.Sequential(
                     nn.Linear(out_channels * 2, out_channels),
