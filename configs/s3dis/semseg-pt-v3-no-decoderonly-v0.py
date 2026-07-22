@@ -8,7 +8,7 @@ empty_cache_per_epoch = True
 enable_amp = True
 amp_dtype = "bfloat16"
 clip_grad = 1.0
-
+# find_unused_parameters=True
 model = dict(
     type="DefaultSegmentorV3",
     num_classes=13,
@@ -19,7 +19,7 @@ model = dict(
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(0,0,0,0), #(coarse→fine order)
-        dec_depths=(4,4,4), #(coarse→fine order)
+        dec_depths=(1,1,10), #(coarse→fine order)
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
@@ -39,7 +39,7 @@ model = dict(
         NO_type="WNO",
         pool_reduce="max",
         head_out_channels=64,  
-        head_fusion="sum",
+        # head_fusion="sum",
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
