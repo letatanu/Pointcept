@@ -1,6 +1,6 @@
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 24
+batch_size = 12
 num_worker = 24
 mix_prob = 0.8
 empty_cache = False
@@ -19,7 +19,7 @@ model = dict(
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(0,0,0,0), #(coarse→fine order)
-        dec_depths=(1,1,10), #(coarse→fine order)
+        dec_depths=(6,4,4), #(coarse→fine order)
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),

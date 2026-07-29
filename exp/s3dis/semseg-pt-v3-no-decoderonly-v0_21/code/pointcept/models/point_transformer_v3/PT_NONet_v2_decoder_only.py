@@ -22,6 +22,197 @@ from pointcept.models.point_transformer_v3.point_transformer_v3m1_base import (
     Embedding,
 )
 
+import torch.nn.functional as F
+
+# ---------------------------------------------------------------------------
+# Deep Learned Point Grouper (DLPG) - Replaces PointSorter
+# ---------------------------------------------------------------------------
+
+class DeepLearnedPointGrouper(PointModule):
+    def __init__(self, in_channels: int, points_per_prototype: int = 1000, max_prototypes: int = 256, min_prototypes: int = 16, num_orders: int = 1):
+        super().__init__()
+        self.points_per_prototype = points_per_prototype
+        self.max_prototypes = max_prototypes
+        self.min_prototypes = min_prototypes
+        self.num_orders = num_orders
+        
+        # Projections for Cross-Attention
+        self.q_proj = nn.Linear(in_channels, in_channels)
+        self.k_proj = nn.Linear(in_channels, in_channels)
+        self.v_proj = nn.Linear(in_channels, in_channels)
+        
+        # Generator to create queries from seed features
+        self.query_generator = nn.Sequential(
+            nn.Linear(in_channels + 3, in_channels),
+            nn.LayerNorm(in_channels),
+            nn.GELU(),
+            nn.Linear(in_channels, in_channels)
+        )
+        
+        # Score predictor from enriched prototype features
+        self.score_mlp = nn.Sequential(
+            nn.Linear(in_channels, in_channels),
+            nn.LayerNorm(in_channels),
+            nn.GELU(),
+            nn.Linear(in_channels, num_orders)
+        )
+
+    def forward(self, point: Point) -> Point:
+        # N points, C channels
+        N, C = point.feat.shape
+        batch_size = int(point.batch.max().item() + 1)
+        
+        # --- 1. Dynamic K Calculation per batch ---
+        queries_list = []
+        K_list = []
+        
+        for b in range(batch_size):
+            mask = point.batch == b
+            room_pts = point.coord[mask]
+            room_feat = point.feat[mask]
+            room_N = room_pts.shape[0]
+            
+            # Dynamic K based on point density
+            K = max(self.min_prototypes, min(self.max_prototypes, room_N // self.points_per_prototype))
+            K_list.append(K)
+            
+            # Sample K seed points using fast voxel downsampling or random sampling
+            # For speed, random permutation is extremely fast and effective for initialization
+            perm = torch.randperm(room_N, device=point.coord.device)[:K]
+            seed_coords = room_pts[perm].float()
+            seed_feats = room_feat[perm]
+            
+            # Generate adaptive queries from seed points
+            seed_input = torch.cat([seed_coords, seed_feats], dim=-1)
+            queries = self.query_generator(seed_input) # (K, C)
+            queries_list.append(queries)
+
+        # Pad queries to max K in this batch for vectorized attention
+        max_K = max(K_list)
+        Q_padded = torch.zeros(batch_size, max_K, C, device=point.feat.device)
+        Q_mask = torch.zeros(batch_size, max_K, device=point.feat.device, dtype=torch.bool)
+        
+        for b, queries in enumerate(queries_list):
+            K = queries.shape[0]
+            Q_padded[b, :K] = queries
+            Q_mask[b, :K] = True
+            
+        # --- 2. Linear projections ---
+        Q_proj = self.q_proj(Q_padded)          # (B, max_K, C)
+        K_proj = self.k_proj(point.feat)        # (N, C)
+        V_proj = self.v_proj(point.feat)        # (N, C)
+        
+        # Grab the active dtype (this will be torch.bfloat16 during AMP)
+        dt = Q_proj.dtype
+        
+        # Pre-allocate efficient tensors WITH matching dtype
+        L = torch.zeros(N, max_K, device=point.feat.device, dtype=dt)
+        W = torch.zeros(N, max_K, device=point.feat.device, dtype=dt)
+        proto_feat = torch.zeros(batch_size, max_K, C, device=point.feat.device, dtype=dt)
+        
+        # Compute calculations strictly per-batch to avoid memory explosions
+        for b in range(batch_size):
+            mask = point.batch == b
+            K_b = K_proj[mask] # (N_b, C)
+            V_b = V_proj[mask] # (N_b, C)
+            Q_b = Q_proj[b]    # (max_K, C)
+            
+            # --- 3. Cross Attention Logits ---
+            L_b = torch.mm(K_b, Q_b.t()) / (C ** 0.5) 
+            valid_K = int(Q_mask[b].sum().item())
+            
+            # Create an explicitly masked version for the prototype Softmax (dim=1) later
+            # Using .clone() prevents in-place mutation of the L_b intermediate
+            L_b_masked = L_b.clone()
+            L_b_masked[:, valid_K:] = float('-inf')
+            L[mask] = L_b_masked.to(dt)
+            
+            # --- Point-wise Softmax (W) ---
+            # Softmax the UNMASKED L_b to mathematically prevent NaN gradients
+            W_b = F.softmax(L_b, dim=0)
+            
+            # THE FIX: Clone W_b to preserve the original memory buffer for autograd,
+            # then apply the zero-mask out-of-place.
+            W_b_safe = W_b.clone()
+            W_b_safe[:, valid_K:] = 0.0 
+            W[mask] = W_b_safe.to(dt)
+            
+            # --- 4. Update Prototype Features ---
+            # Ensure we use the safe, masked version for the matrix multiplication
+            proto_feat[b] = torch.mm(W_b_safe.t(), V_b).to(dt)
+
+        # Softmax across prototypes
+        A = F.softmax(L, dim=1) # (N, max_K)
+                
+        # --- 5. Predict Scores ---
+        proto_scores = self.score_mlp(proto_feat) # (B, max_K, num_orders)
+        proto_scores_mapped = proto_scores[point.batch] # (N, max_K, num_orders)
+        
+        # Back-Project
+        point_scores = (A.unsqueeze(-1) * proto_scores_mapped).sum(dim=1) # (N, num_orders)
+        scores = torch.sigmoid(point_scores)
+        
+        # Calculate Auxiliary Self-Supervised Losses
+        if self.training:
+            # 1. Build proto_coords safely (Coordinates are explicitly float32)
+            proto_coords = torch.zeros(batch_size, max_K, 3, device=Q_padded.device, dtype=torch.float32)
+            for b in range(batch_size):
+                mask = point.batch == b
+                # Force the autocast result back to float32
+                proto_coords[b] = torch.mm(W[mask].float().t(), point.coord[mask].float()).float()
+
+            # 2. Prepare squared norms
+            v_sq = (V_proj ** 2).sum(dim=-1, keepdim=True)              
+            p_sq = (proto_feat ** 2).sum(dim=-1)[point.batch]           
+            
+            c_sq = (point.coord.float() ** 2).sum(dim=-1, keepdim=True) 
+            pc_sq = (proto_coords ** 2).sum(dim=-1)[point.batch]        
+            
+            # 3. Compute cross terms safely per batch
+            feat_dot = torch.zeros(N, max_K, device=V_proj.device, dtype=dt)          # Matches V_proj dtype
+            coord_dot = torch.zeros(N, max_K, device=V_proj.device, dtype=torch.float32) # Matches coord dtype
+            
+            for b in range(batch_size):
+                mask = point.batch == b
+                feat_dot[mask] = torch.mm(V_proj[mask], proto_feat[b].t())
+                # Force the autocast result back to float32 to match coord_dot
+                coord_dot[mask] = torch.mm(point.coord[mask].float(), proto_coords[b].t()).float()
+                
+            # 4. Final Distances: ||X||^2 + ||Y||^2 - 2X^TY
+            # (Clamped to 0.0 to prevent floating point inaccuracies from yielding negative distances)
+            feat_dist_sq = torch.clamp(v_sq + p_sq - 2 * feat_dot, min=0.0)
+            loss_variance = (A * feat_dist_sq).sum(dim=1).mean()
+            
+            coord_dist_sq = torch.clamp(c_sq + pc_sq - 2 * coord_dot, min=0.0)
+            loss_coverage = (A * coord_dist_sq).sum(dim=1).mean()
+            
+            point.dlpg_variance_loss = loss_variance
+            point.dlpg_coverage_loss = loss_coverage
+
+        # --- 6. Generate Sort Orders ---
+        batch_offset = point.batch.unsqueeze(1) * (scores.max().detach() + 10.0)
+        scores_with_batch = scores + batch_offset
+        
+        orders_list = []
+        inverses_list = []
+        
+        scores_t = scores_with_batch.transpose(0, 1) 
+        for i in range(self.num_orders):
+            order = torch.argsort(scores_t[i])
+            inverse = torch.zeros_like(order)
+            inverse[order] = torch.arange(len(order), device=order.device)
+            orders_list.append(order)
+            inverses_list.append(inverse)
+            
+        if self.num_orders == 1:
+            scores = scores.squeeze(1)
+            
+        point.sort_scores = scores
+        point.learned_order = torch.stack(orders_list)
+        point.learned_inverse = torch.stack(inverses_list)
+        
+        return point
+
 class DropPath(nn.Module):
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
@@ -749,16 +940,25 @@ class PointTransformerV3_NO_DecoderOnly(PointModule):
 
         self.embedding = Embedding(in_channels, enc_channels[0], bn_layer, act_layer)
 
-        # 1. OPTNet-style Learned Serialization
-        self.learned_serializers = nn.ModuleList(
-            [
-                LearnedSerialization(
-                    in_channels=channels,
-                    num_orders=len(self.order),
-                )
-                for channels in enc_channels
-            ]
+        # 1. OPTNet-style DLPG (Shared to reduce complexity)
+        self.shared_grouper_dim = 64  # Or whatever baseline dimension you prefer
+        
+        # A single shared grouper for all stages
+        self.shared_grouper = DeepLearnedPointGrouper(
+            in_channels=self.shared_grouper_dim, 
+            points_per_prototype=1000, 
+            max_prototypes=256,        
+            min_prototypes=16,         
+            num_orders=len(self.order)
         )
+        
+        # Lightweight linear adapters to project features to the shared dimension
+        self.grouper_adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(enc_channels[i], self.shared_grouper_dim),
+                nn.LayerNorm(self.shared_grouper_dim)
+            ) for i in range(self.num_stages)
+        ])
 
         # 2. Encoder: GridPooling scaffold
         enc_drop_path = [x.item() for x in torch.linspace(0, drop_path, sum(enc_depths))]
@@ -868,7 +1068,24 @@ class PointTransformerV3_NO_DecoderOnly(PointModule):
             nn.LayerNorm(head_out_channels),
             nn.GELU(),
         )
-
+        
+        
+    def apply_shared_grouper(self, point: Point, stage_idx: int) -> Point:
+        # Save original features
+        original_feat = point.feat
+        
+        # Project to shared dimension
+        point.feat = self.grouper_adapters[stage_idx](original_feat)
+        
+        # Run the shared grouper (calculates point.sort_scores, point.learned_order, etc.)
+        point = self.shared_grouper(point)
+        
+        # Restore original features for the main network path
+        point.feat = original_feat
+        
+        return point
+    
+    
     def compute_ordering_loss(self, point: Point, scores: torch.Tensor):
         # scores: (N, K), one learned ranking score for each of K orders.
         if scores.dim() == 1:
@@ -929,38 +1146,57 @@ class PointTransformerV3_NO_DecoderOnly(PointModule):
         # 2. Input embedding.
         point = self.embedding(point)
 
-        # 3. Finest-scale PointSorter.
+        # 3. Finest-scale Point Grouper.
         ordering_losses = []
+        dlpg_aux_losses = []
 
-        point = self.learned_serializers[0](point)
+        point = self.apply_shared_grouper(point, stage_idx=0)
+        
         if self.training and self.ordering_loss_weight > 0:
             ordering_losses.append(
                 self.compute_ordering_loss(point, point.sort_scores)
             )
+            dlpg_aux_losses.append(
+                getattr(point, "dlpg_variance_loss", 0.0) + getattr(point, "dlpg_coverage_loss", 0.0)
+            )
 
-        # 4. Grid hierarchy plus scale-specific PointSorter.
+        # 4. Grid hierarchy plus scale-specific Point Grouper.
         scaffold = []
 
         for stage_idx, pool in enumerate(self.pre_pool_stages):
             scaffold.append(point)
             point = pool(point)
-            point = self.learned_serializers[stage_idx + 1](point)
+            
+            # Apply shared grouper using the correct adapter index
+            point = self.apply_shared_grouper(point, stage_idx=stage_idx + 1)
 
             if self.training and self.ordering_loss_weight > 0:
                 ordering_losses.append(
                     self.compute_ordering_loss(point, point.sort_scores)
                 )
+                dlpg_aux_losses.append(
+                    getattr(point, "dlpg_variance_loss", 0.0) + getattr(point, "dlpg_coverage_loss", 0.0)
+                )
 
-        ordering_loss = (
-            torch.stack(ordering_losses).mean()
-            * self.ordering_loss_weight
-            if ordering_losses
-            else point.feat.new_zeros(())
-        )
-        
-        # FIX: Do not attach it to the `point` variable yet, as `point` will be overwritten.
-        # Save it in a distinct local variable.
-        final_ordering_loss = ordering_loss
+        if self.training and self.ordering_loss_weight > 0:
+            # Main rank ordering loss
+            main_ord_loss = (
+                torch.stack(ordering_losses).mean() * self.ordering_loss_weight
+                if ordering_losses
+                else point.feat.new_zeros(())
+            )
+            
+            # DLPG Auxiliary clustering losses (weighted by 0.1 to not overwhelm main loss)
+            dlpg_tensors = [l for l in dlpg_aux_losses if isinstance(l, torch.Tensor)]
+            aux_loss = (
+                torch.stack(dlpg_tensors).mean() * 0.1 
+                if dlpg_tensors 
+                else point.feat.new_zeros(())
+            )
+            
+            final_ordering_loss = main_ord_loss + aux_loss
+        else:
+            final_ordering_loss = point.feat.new_zeros(())
 
         # 5. Coarsest blocks.
         point = self.coarse_blocks(point)
@@ -980,17 +1216,28 @@ class PointTransformerV3_NO_DecoderOnly(PointModule):
             if key in point.keys():
                 point.pop(key)
 
-        #  Attach the saved ordering loss
+        # Attach the saved ordering loss
         point["ordering_loss"] = final_ordering_loss
-        
-        # --- The Nuclear DDP Anchor ---
-        # Physically wire the MLP parameters to the output feature graph
+
+
+        # Physically wire the DLPG and adapter parameters to the output feature graph
         # to guarantee DDP never flags them as unused, regardless of config weights.
         if self.training:
             dummy_anchor = 0.0
-            for serializer in self.learned_serializers:
-                for param in serializer.sorter.mlp.parameters():
+            
+            # 1. Anchor the Shared Grouper
+            if hasattr(self.shared_grouper, "query_generator"):
+                for param in self.shared_grouper.query_generator.parameters():
                     dummy_anchor = dummy_anchor + param.sum() * 0.0
+            if hasattr(self.shared_grouper, "score_mlp"):
+                for param in self.shared_grouper.score_mlp.parameters():
+                    dummy_anchor = dummy_anchor + param.sum() * 0.0
+            
+            # 2. Anchor the Linear Adapters
+            for adapter in self.grouper_adapters:
+                for param in adapter.parameters():
+                    dummy_anchor = dummy_anchor + param.sum() * 0.0
+                    
             point.feat = point.feat + dummy_anchor
 
         return point
