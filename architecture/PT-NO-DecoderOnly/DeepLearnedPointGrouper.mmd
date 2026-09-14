@@ -1,0 +1,38 @@
+flowchart TD
+    A([Raw Point Cloud]) --> B[Embedding\nLinear → BN → GELU]
+    B --> C[sparsify only\nno fixed serialization]
+    C --> D[apply_shared_grouper\nstage 0]
+
+    subgraph DLPG [DeepLearnedPointGrouper — MAP + Prototype]
+      direction TB
+      P1[Dynamic K\nN // points_per_prototype\nclamped min/max] --> P2[Random seed sampling\nK prototype coords + feats]
+      P2 --> P3[query_generator\nLinear→LN→GELU→Linear]
+      P3 --> P4[Cross-Attention\nQ from prototypes\nK V from all points\nL = K_proj · Q_proj^T / √C]
+      P4 --> P5[Softmax dim=0 → W\nMasked Average Pool\nproto_feat = W^T · V]
+      P5 --> P6[score_mlp\nLinear→LN→GELU→Linear\nproto_scores per prototype]
+      P6 --> P7[Softmax dim=1 → A\nback-project\npoint_scores = Σ A · proto_scores]
+      P7 --> P8[sigmoid scores\nlearned_order argsort\nlearned_inverse stored]
+      P5 --> P9[Aux Losses:\nloss_variance + loss_coverage]
+    end
+
+    D --> E[GridPooling ×4\ntraceable scaffold\nno serialization propagated]
+    E --> E2[apply_shared_grouper\nper stage via adapter projection\nLinear → LN shared_grouper_dim=64]
+    E2 --> F[Coarsest Scale\nPointSorterBlock ×N\n+ QuatRPEBlockWrapper]
+
+    subgraph PSBlock [PointSorterBlock — Learned-Order Attention]
+      direction LR
+      S1[select order_id from learned_order] --> S2[reorder feat by learned order]
+      S2 --> S3[split into patches\nMultiheadAttention + MLP]
+      S3 --> S4[reorder back via learned_inverse]
+    end
+
+    F --> G1[OrderAwareFusedGridUnpooling\nStage 3→2\n2×num_orders score gate]
+    G1 --> H1[PointSorterBlock Decoder\n+ QuatRPEBlockWrapper]
+    H1 --> G2[OrderAwareFusedGridUnpooling\nStage 2→1]
+    G2 --> H2[PointSorterBlock Decoder\n+ QuatRPEBlockWrapper]
+    H2 --> G3[OrderAwareFusedGridUnpooling\nStage 1→0]
+    G3 --> H3[PointSorterBlock Decoder\n+ QuatRPEBlockWrapper]
+    H3 --> I[Output Projection\nLinear → LN → GELU]
+    I --> K([Seg Head → Classes])
+
+    L[Total Loss =\nSeg Loss\n+ λ·ordering_loss\n+ 0.1·dlpg_aux_loss] -.-> K

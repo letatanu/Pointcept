@@ -17,6 +17,8 @@ from .nuscenes import NuScenesDataset
 from .waymo import WaymoDataset
 from .aerorelief3d import AeroRelief3DDataset
 from .dales import DALESDataset
+from .occufly import OccuFlyDataset
+
 # object
 from .modelnet import ModelNetDataset
 from .shapenet_part import ShapeNetPartDataset

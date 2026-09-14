@@ -1,0 +1,31 @@
+flowchart TD
+    A([Raw Point Cloud\ncoord + color]) --> B[Embedding\nLinear → BN → GELU]
+    B --> C[Base Serialization\nZ / Hilbert orders]
+    subgraph GridPooling
+      direction LR
+      C --> D[Grid Pooling\ncoarse-to-fine]
+      D --> D1[Grid Unpooling\ncoarse-to-fine]
+    end
+
+    subgraph Decoder Stage/Unpooling
+      direction LR
+    F[UpProj ×4\ncoarse-to-fine]
+      F --> F1[down_proj → WNO3dBlock]
+      F1 --> F2[feat_proj + gate·σ]
+      F2 --> F3[Attention Decoder Blocks\nQuatRPEBlockWrapper]
+    end
+
+    D --> F
+    F1 --> J[Output Projection\nLinear → LN → GELU]
+    J --> K([Seg Head → Classes])
+
+    subgraph WNO3dBlock
+      direction LR
+      W1[Conv3D Decompose ×3\nwavelet decomposition] --> W2[Global Mix Conv3D]
+      W2 --> W3[ConvTranspose3D Recon ×3\ncoarse-to-fine]
+    end
+    subgraph QuatRPE
+      direction LR
+      Q1[Build quaternion\nfrom 3D delta] --> Q2[Freq encoding\nsin r·freqs]
+      Q2 --> Q3[Apply quat rotation\nto feature groups]
+    end

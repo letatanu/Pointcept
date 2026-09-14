@@ -1,0 +1,28 @@
+flowchart TD
+    A([Raw Point Cloud]) --> B[Embedding\nLinear → BN → GELU]
+    B --> C[Base Serialization\nZ / Hilbert orders]
+    C --> D[LearnedSerialization\nPointSorter MLP]
+    D --> D1{cat coord + feat\n→ MLP → sigmoid scores}
+    D1 --> D2[argsort → learned_order\nlearned_inverse stored]
+    D2 --> D3[OrderingLoss\nlocality + distribution]
+
+    D2 --> E[GridPooling ×4\npropagates sort_scores\nvia segment_csr mean]
+    E --> F[Coarsest Scale\nPTv3 Blocks no QuatRPE]
+    F --> G1[OrderAwareFusedGridUnpooling\nStage 3→2]
+
+    subgraph OAFGUnpool [OrderAwareFusedGridUnpooling]
+      direction TB
+      U1[up_proj + pooling_inverse expand] --> U2[Score-Diff Gate\ncat c_scores−f_scores, avg\n→ Linear→GELU→Linear→Sigmoid\n→ multiply feat_up]
+      U2 --> U3[down_proj → Shared WNO\nfeat_proj]
+      U3 --> U4{fusion mode}
+      U4 -- concat --> U5[proj_concat\nLinear → LN]
+      U4 -- add --> U6[scalar gate·σ\nfeat + gate·feat_no]
+    end
+
+    G1 --> H1[PTv3 Decoder Blocks\nstandard Block no QuatRPE]
+    H1 --> G2[OrderAwareFusedGridUnpooling\nStage 2→1]
+    G2 --> H2[PTv3 Decoder Blocks]
+    H2 --> G3[OrderAwareFusedGridUnpooling\nStage 1→0]
+    G3 --> H3[PTv3 Decoder Blocks]
+    H3 --> I[Output Projection]
+    I --> K([Seg Head → Classes])
