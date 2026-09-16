@@ -3,7 +3,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 50
+batch_size = 20
 # num_worker = 20
 mix_prob = 0.8
 empty_cache = False
@@ -35,7 +35,7 @@ names = [
         "Crane",
         "Truck",
     ]
-grid_size = 0.5
+grid_size = 0.22
 
 model = dict(
     type="DefaultSegmentorV3Redesigned",

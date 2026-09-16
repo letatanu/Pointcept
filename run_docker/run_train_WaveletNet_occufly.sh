@@ -14,7 +14,7 @@ echo "Starting OccuFly Training on Devices: $DEVICES"
 
 MODEL_NAME="occufly"
 MODEL_NAME="semseg-aerial-wavelet-v1"
-EXP_NAME="AerialWaveletNet_01"
+EXP_NAME="AerialWaveletNet_02"
 
 ## --------------------------------------------------------- ##
 DATASET="occufly"
