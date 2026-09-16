@@ -32,7 +32,7 @@ model = dict(
         # Pairwise quaternion attention uses explicit attention bias.
         enable_flash=True,
         use_quaternion_rpe=True,
-        quaternion_pair_chunk_size=65536,
+        
         # Select: haar_wno, haar_wno_cnn, fno, or none.
         context_operator="haar_wno",
         context_stages=(True, True, True, True),

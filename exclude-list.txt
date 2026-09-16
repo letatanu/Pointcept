@@ -3,3 +3,5 @@ exp
 data
 .vscode
 .github
+architecture
+.git

@@ -3,7 +3,7 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 12
+batch_size = 10
 num_worker = 20
 mix_prob = 0.8
 empty_cache = False
