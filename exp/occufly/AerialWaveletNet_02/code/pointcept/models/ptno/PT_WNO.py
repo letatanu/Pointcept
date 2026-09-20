@@ -18,6 +18,7 @@ This file is intended to be placed in the Pointcept model package. It uses
 the Pointcept PTv3 mode-1 base classes supplied with the original submission.
 """
 
+from contextlib import nullcontext
 from functools import partial
 import math
 
@@ -64,6 +65,8 @@ class QuaternionPointEmbedding(nn.Module):
     Builds one quaternion q_i for each point relative to the centroid of
     its own scene, then projects quaternion and radial-frequency features
     from (N, 5 + 2F) to (N, C).
+
+    Unlike QuaternionRelativeBias, this never creates (W, H, K, K) tensors.
     """
 
     def __init__(self, channels, num_frequencies=8):
@@ -677,7 +680,8 @@ class DefaultSegmentorV3Redesigned(nn.Module):
                 parameter.requires_grad_(False)
 
     def forward(self, input_dict, return_point=False):
-        with torch.no_grad() if self.freeze_backbone else torch.enable_grad():
+        # Respect the caller's gradient mode during evaluation and training.
+        with torch.no_grad() if self.freeze_backbone else nullcontext():
             point = self.backbone(input_dict)
         logits = self.seg_head(point.feat)
 

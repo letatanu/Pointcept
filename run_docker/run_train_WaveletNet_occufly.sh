@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="3,4,5,6,7"
+DEVICES="1,2,3,4,5,6,7"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -14,7 +14,7 @@ echo "Starting OccuFly Training on Devices: $DEVICES"
 
 MODEL_NAME="occufly"
 MODEL_NAME="semseg-aerial-wavelet-v1"
-EXP_NAME="AerialWaveletNet_02"
+EXP_NAME="AerialWaveletNet_06"
 
 ## --------------------------------------------------------- ##
 DATASET="occufly"
