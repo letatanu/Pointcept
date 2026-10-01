@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="2,3,4,5,6,7"
+DEVICES="7"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -13,13 +13,12 @@ DOCKER_IMAGE="letatanu/pointcept1"
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
 
 MODEL_NAME="semseg-aerial-wavelet-v1"
-EXP_NAME="AerialWaveletNet_07"
+EXP_NAME="AerialWaveletNet_38"
 ## --------------------------------------------------------- ##
 DATASET="aerorelief3d"
 echo "Model Name: $MODEL_NAME"
 echo "Devices: $DEVICES"
-
-docker run --ulimit nofile=1048576:1048576 --ipc=host \
+docker run --init --ulimit nofile=1048576:1048576 --ipc=host \
   --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
@@ -30,4 +29,4 @@ docker run --ulimit nofile=1048576:1048576 --ipc=host \
       -p python \
       -d ${DATASET} \
       -c ${MODEL_NAME} \
-      -n ${EXP_NAME}"
+      -n ${EXP_NAME} -r true"

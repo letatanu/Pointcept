@@ -3,16 +3,15 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 10
-num_worker = 20
+batch_size = 2
+num_worker = 24
 mix_prob = 0.8
-empty_cache = False
-empty_cache_per_epoch = True
+empty_cache = True
 enable_amp = True
 amp_dtype = "bfloat16"
-clip_grad = 1.0
+clip_grad = 3.0
 
-names = ["Building-Damage", "Building-No-Damage", "Road", "Tree", "Background"]
+names = ["Background", "Building-Damage", "Building-No-Damage", "Road", "Tree"]
 grid_size = 0.22
 
 model = dict(
@@ -24,29 +23,33 @@ model = dict(
         in_channels=6,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
-        enc_depths=(4, 4, 2, 6, 2),
-        enc_channels=(32, 64, 128, 256, 512),
-        enc_num_head=(2, 4, 8, 16, 32),
+        enc_depths=(3, 3, 3, 12, 3),
+        enc_channels=(48, 96, 192, 384, 512),
+        # enc_channels=(48, 96, 192, 384, 512),
+        enc_num_head=(4, 8, 12, 24, 32),
         enc_patch_size=(1024, 1024, 1024, 1024, 1024),
         drop_path=0.2,
         # Pairwise quaternion attention uses explicit attention bias.
         enable_flash=True,
         use_quaternion_rpe=True,
-        
+        shared_context_operator=True,
         # Select: haar_wno, haar_wno_cnn, fno, or none.
         context_operator="haar_wno",
         context_stages=(True, True, True, True),
-        context_channels=32,
-        context_grid_size=(32, 32, 32),
+        context_channels=64,
+        context_grid_size=(64,64,64),
         haar_levels=3,
         fno_modes=4,
         # Decoder-enabled configuration.
         use_decoder=True,
         dec_depths=(2, 2, 2, 2),
-        dec_channels=(64, 64, 128, 256),
-        dec_num_head=(4, 4, 8, 16),
+        dec_channels=(48, 96, 192, 384),
+        dec_num_head=(4, 8, 12, 24),
         dec_patch_size=(1024, 1024, 1024, 1024),
         head_channels=64,
+        quaternion_base=10000.0,
+        quaternion_learnable_frequencies=True,
+        quaternion_learnable_axes=True
     ),
     criteria=[
         dict(type="CrossEntropyLoss", loss_weight=1.0, ignore_index=-1),
@@ -55,18 +58,15 @@ model = dict(
 )
 
 epoch = 1000
-eval_epoch = 100
-optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
-
+optimizer = dict(type='AdamW', lr=0.001, weight_decay=0.05)
 scheduler = dict(
-    type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
+    type='OneCycleLR',
+    max_lr=[0.001, 0.0001],
     pct_start=0.05,
-    anneal_strategy="cos",
+    anneal_strategy='cos',
     div_factor=10.0,
-    final_div_factor=1000.0,
-)
-param_dicts = [dict(keyword="block", lr=0.0006)]
+    final_div_factor=1000.0)
+param_dicts = [dict(keyword='backbone', lr=0.0001)]
 
 dataset_type = "AeroRelief3DDataset"
 data_root = "data/aerorelief3d/pointcept"
@@ -89,7 +89,8 @@ common_train = [
     dict(type="CenterShift", apply_z=False),
     dict(type="NormalizeColor"),
     dict(type="ToTensor"),
-    dict(type="Collect", keys=("coord", "grid_coord", "segment"), feat_keys=("coord", "color")),
+    dict(type="Collect", keys=("coord", "grid_coord", "segment"), 
+    feat_keys=("coord", "color")),
 ]
 
 data = dict(
@@ -110,11 +111,16 @@ data = dict(
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),
-            dict(type="GridSample", grid_size=grid_size, hash_type="fnv", mode="train", return_grid_coord=True, return_inverse=True),
+            dict(type="GridSample", 
+                 grid_size=grid_size,
+                 hash_type="fnv", mode="train", 
+                 return_grid_coord=True, 
+                 return_inverse=True),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
-            dict(type="Collect", keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"), feat_keys=("coord", "color")),
+            dict(type="Collect", keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"), 
+            feat_keys=("coord", "color")),
         ],
         test_mode=False,
     ),
@@ -132,12 +138,7 @@ data = dict(
                 dict(type="ToTensor"),
                 dict(type="Collect", keys=("coord", "grid_coord", "index"), feat_keys=("coord", "color")),
             ],
-            aug_transform=[
-                [dict(type="RandomScale", scale=[s, s])] for s in [0.9, 0.95, 1.0, 1.05, 1.1]
-            ] + [
-                [dict(type="RandomScale", scale=[s, s]), dict(type="RandomFlip", p=1)]
-                for s in [0.9, 0.95, 1.0, 1.05, 1.1]
-            ],
-        ),
-    ),
-)
+                  aug_transform=[[{
+                'type': 'RandomScale',
+                'scale': [1.0, 1.0]
+            }]])))
