@@ -117,7 +117,7 @@ def convert_pointcept_npy_to_ply(pred_npy_path, coord_npy_path, ply_path, logger
 
     # 3. Generate color map
     np.random.seed(42)
-    max_class = preds.max() + 1
+    max_class = preds.max()
     cmap = np.random.rand(max_class, 3)
     color = cmap[preds]
     color = np.ascontiguousarray(color, dtype=np.float64)
@@ -222,7 +222,7 @@ COLORMAPS = {
     ], dtype=np.float64),
 
     "dales": np.array([
-        [0.50, 0.50, 0.50],  # 0: Unknown
+        # [0.50, 0.50, 0.50],  # 0: Unknown
         [0.00, 0.00, 1.00],  # 1: Ground
         [0.00, 1.00, 0.00],  # 2: Vegetation
         [1.00, 0.00, 0.00],  # 3: Cars
@@ -234,11 +234,12 @@ COLORMAPS = {
     ], dtype=np.float64),
 
     "3daerorelief": np.array([
-        [0.902, 0.098, 0.294],  # 0: Building-Damage
-        [0.275, 0.941, 0.941],  # 1: Building-No-Damage
-        [1.000, 1.000, 0.098],  # 2: Road
-        [0.000, 0.502, 0.000],  # 3: Tree
-        [0.000, 0.000, 0.000],  # 4: Background
+        [0.000, 0.000, 0.000],  # 0: Background
+        [0.902, 0.098, 0.294],  # 1: Building-Damage
+        [0.275, 0.941, 0.941],  # 2: Building-No-Damage
+        [1.000, 1.000, 0.098],  # 3: Road
+        [0.000, 0.502, 0.000],  # 4: Tree
+       
     ], dtype=np.float64),
 }
 
@@ -270,7 +271,7 @@ def load_color(path):
     return c / 255.0 if c.max() > 1.0 else c
 
 def get_label_colors(labels, colormap):
-    labels = labels.flatten()  +1
+    labels = labels.flatten()
     return np.ascontiguousarray(colormap[np.clip(labels, 0, len(colormap) - 1)], dtype=np.float64)
 
 
@@ -332,21 +333,32 @@ def process_dataset(dataset_name, result_dir, data_dir, output_dir=None):
         except Exception as e:
             print(f"    [ERR] _pred.ply: {e}")
 
-        # # Ground truth
-        # gt_path = None
-        
-        # if os.path.exists(paths['segment']): gt_path = paths['segment']
-        # elif os.path.exists(paths['segment20']):gt_path = paths['segment20']
-        # else:
-        #     print(f"    [WARN] segment.npy not found, skipping _gt.ply")
-        # try:
-        #     gt = np.load(gt_path)
-        #     save_ply_with_class(coord, get_label_colors(gt, colormap), gt,
-        #                         os.path.join(output_dir, f"{base_name}_gt.ply"))
-        #     print(f"    [OK] _gt.ply")
-        # except Exception as e:
-        #     print(f"    [ERR] _gt.ply: {e}")
-    
+        # Ground truth — segment.npy
+        gt_path = paths["segment"]
+
+        if not os.path.exists(gt_path):
+            print(f"    [WARN] segment.npy not found: {gt_path}")
+        else:
+            try:
+                gt = np.load(gt_path).flatten()
+
+                if gt.shape[0] != coord.shape[0]:
+                    raise ValueError(
+                        f"GT/coord mismatch: GT={gt.shape[0]:,}, "
+                        f"coord={coord.shape[0]:,}"
+                    )
+
+                save_ply_with_class(
+                    coord,
+                    get_label_colors(gt-1, colormap),
+                    gt,
+                    os.path.join(output_dir, f"{base_name}_gt.ply")
+                )
+
+                print(f"    [OK] _gt.ply")
+
+            except Exception as e:
+                print(f"    [ERR] _gt.ply: {e}")
 
 
 # =============================================================================
@@ -358,9 +370,9 @@ DATASETS = [
     #                             "data_dir":   "data/s3dis"},
     # {"name": "scannet",        "result_dir": "exp/scannet/semseg-pt-v3m1-0-base/result",
     #                             "data_dir":   "data/scannet/val"},
-    {"name": "dales",          "result_dir": "exp/dales/semseg-pt-v3m1-0-base/result",
+    {"name": "dales",          "result_dir": "exp/utonia/AerialWaveletNet_01/result",
                                 "data_dir":   "data/dales/pointcept/test"},
-    # {"name": "3daerorelief",   "result_dir": "exp/aerorelief3d/semseg-pt-v3m1-0-base/result",
+    # {"name": "3daerorelief",   "result_dir": "exp/utonia/utonia_01/result",
     #                             "data_dir":   "data/aerorelief3d/pointcept/Area_2"},
 ]
 

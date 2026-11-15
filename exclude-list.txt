@@ -5,3 +5,4 @@ data
 .github
 architecture
 .git
+pretrained

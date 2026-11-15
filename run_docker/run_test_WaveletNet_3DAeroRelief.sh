@@ -2,7 +2,7 @@
 set -e
 
 # Set available GPUs (adjust as needed, e.g., "0" or "0,1")
-DEVICES="6"
+DEVICES="all"
 # Calculate number of processes based on devices
 OMP_NUM_THREADS=4
 
@@ -11,6 +11,7 @@ OMP_NUM_THREADS=4
 DOCKER_IMAGE="letatanu/pointcept1"
 
 echo "Starting AeroRelief3D Training on Devices: $DEVICES"
+
 MODEL_NAME="semseg-aerial-wavelet-v1"
 EXP_NAME="AerialWaveletNet_10"
 ## --------------------------------------------------------- ##
@@ -22,7 +23,7 @@ docker run --init --ulimit nofile=1048576:1048576 --ipc=host \
   --rm -ti \
   --gpus "\"device=${DEVICES}\"" \
   -w /working \
-  -v /data/nhl224/code/semantic_3D/Pointcept/:/working \
+  -v /media/volume/Nhut_Data-1/Pointcept/:/working \
   -e OMP_NUM_THREADS=${OMP_NUM_THREADS} \
   "${DOCKER_IMAGE}"    \
   bash -lc "

@@ -8,9 +8,9 @@ Select one ablation below. Example input feat = [RGB, normal_xyz]; adjust the
 feature indices to your actual data pipeline. Raw XYZ is never a scalar input.
 """
 
-ablation = "equivariance"  # "final", "deep_supervision", "equivariance", or "full"
+ablation = "full"  # "final", "deep_supervision", "equivariance", or "full"
 
-batch_size = 4
+batch_size = 6
 num_worker = 24
 mix_prob = 0.8
 empty_cache = True
@@ -20,16 +20,16 @@ enable_amp = True
 ablation_options = dict(
     final=dict(),
     deep_supervision=dict(deep_supervision=True),
-    equivariance=dict(equivariance_regularization=True),
+    equivariance=dict(equivariance_loss=True),
     full=dict(
         deep_supervision=True,
-        equivariance_regularization=True,
+        equivariance_loss=True,
         invariance_regularization=True,
     ),
 )
 
 model = dict(
-    type="DefaultSegmentorV3SO3",
+    type="QuatFrameSegmentor",
     num_classes=13,
     backbone_out_channels=64,
     ignore_index=-1,
@@ -45,9 +45,18 @@ model = dict(
     equivariance_weight=0.01,
     invariance_weight=0.01,
     consistency_stage_weights=(1.0, 1.0, 1.0, 1.0, 1.0),
-    consistency_detach_target=False,
+    consistency_detach_target=True,
     backbone=dict(
         type="SO3-QuatTransport-v1",
+        quaternion_geometry="relational",  # ablation: "distance"
+        include_qk_alignment=False,
+        transport_mode="symmetric_qk",  # ablation: "k_only"
+        transport_value=False,
+        scalar_attention=True,
+        qk_normalization=True,
+        beta_max=3.141592653589793,
+        # Scalar LayerNorm; invariant vector RMSNorm; separate head branch norms.
+        # Feature RMS epsilon never enters direction/quaternion normalization.
         in_channels=6,
         scalar_feature_indices=(0, 1, 2),
         vector_feature_groups=((3, 4, 5),),
@@ -57,7 +66,7 @@ model = dict(
         num_heads=(2, 4, 8, 16, 16),
         neighbors=(8, 8, 12, 12, 16),
         sample_ratios=(0.25, 0.25, 0.25, 0.25),
-        use_decoder=False,
+        use_decoder=True,
         head_channels=64,
     ),
     **ablation_options[ablation],
@@ -82,17 +91,32 @@ dataset_type = "S3DISDataset"
 data_root = "data/s3dis"
 
 data = dict(
-    num_classes=13, 
+    num_classes=13,
     ignore_index=-1,
-    names=["ceiling", "floor", "wall", "beam", "column", "window", "door",
-           "table", "chair", "sofa", "bookcase", "board", "clutter"],
+    names=[
+        "ceiling",
+        "floor",
+        "wall",
+        "beam",
+        "column",
+        "window",
+        "door",
+        "table",
+        "chair",
+        "sofa",
+        "bookcase",
+        "board",
+        "clutter",
+    ],
     train=dict(
         type=dataset_type,
         split=("Area_1", "Area_2", "Area_3", "Area_4", "Area_6"),
         data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
-            dict(type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2),
+            dict(
+                type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2
+            ),
             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
             dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="x", p=0.5),
             dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="y", p=0.5),
@@ -102,47 +126,75 @@ data = dict(
             dict(type="ChromaticAutoContrast", p=0.2, blend_factor=None),
             dict(type="ChromaticTranslation", p=0.95, ratio=0.05),
             dict(type="ChromaticJitter", p=0.95, std=0.05),
-            dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="train", return_grid_coord=True),
+            dict(
+                type="GridSample",
+                grid_size=0.02,
+                hash_type="fnv",
+                mode="train",
+                return_grid_coord=True,
+            ),
             dict(type="SphereCrop", sample_rate=0.6, mode="random"),
-            dict(type="SphereCrop", point_max=40960, mode="random"),
+            dict(type="SphereCrop", point_max=20000, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
-            dict(type="Collect",
-                 keys=("coord", "grid_coord", "segment"),
-                 feat_keys=("color", "normal")),
+            dict(
+                type="Collect",
+                keys=("coord", "grid_coord", "segment"),
+                feat_keys=("color", "normal"),
+            ),
         ],
         test_mode=False,
     ),
     val=dict(
-        type=dataset_type, split="Area_5", data_root=data_root,
+        type=dataset_type,
+        split="Area_5",
+        data_root=data_root,
         transform=[
             dict(type="CenterShift", apply_z=True),
             dict(type="Copy", keys_dict={"segment": "origin_segment"}),
-            dict(type="GridSample", grid_size=0.02, hash_type="fnv", mode="train", return_grid_coord=True, return_inverse=True),
+            dict(
+                type="GridSample",
+                grid_size=0.02,
+                hash_type="fnv",
+                mode="train",
+                return_grid_coord=True,
+                return_inverse=True,
+            ),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
-            dict(type="Collect",
-                 keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
-                 feat_keys=("color", "normal")),
+            dict(
+                type="Collect",
+                keys=("coord", "grid_coord", "segment", "origin_segment", "inverse"),
+                feat_keys=("color", "normal"),
+            ),
         ],
         test_mode=False,
     ),
     test=dict(
-        type=dataset_type, split="Area_5", data_root=data_root,
+        type=dataset_type,
+        split="Area_5",
+        data_root=data_root,
         transform=[dict(type="CenterShift", apply_z=True), dict(type="NormalizeColor")],
         test_mode=True,
         test_cfg=dict(
-            voxelize=dict(type="GridSample", 
-                          grid_size=0.02, hash_type="fnv", mode="test", return_grid_coord=True),
+            voxelize=dict(
+                type="GridSample",
+                grid_size=0.02,
+                hash_type="fnv",
+                mode="test",
+                return_grid_coord=True,
+            ),
             crop=None,
             post_transform=[
                 dict(type="CenterShift", apply_z=False),
                 dict(type="ToTensor"),
-                dict(type="Collect",
-                     keys=("coord", "grid_coord", "index"),
-                     feat_keys=("color", "normal")),
+                dict(
+                    type="Collect",
+                    keys=("coord", "grid_coord", "index"),
+                    feat_keys=("color", "normal"),
+                ),
             ],
             aug_transform=[
                 [dict(type="RandomScale", scale=[0.9, 0.9])],

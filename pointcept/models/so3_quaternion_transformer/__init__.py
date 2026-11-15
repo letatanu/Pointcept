@@ -1,1 +1,1 @@
-from .so3_quaternion_transformer import *
+from .so3_vn_independent_attention import *

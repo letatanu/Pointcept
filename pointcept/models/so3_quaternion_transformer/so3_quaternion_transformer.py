@@ -1,9 +1,37 @@
-"""Local SO(3) quaternion transport network for Pointcept.
-Scalar inputs must be invariant; vector groups must rotate with coordinates.
-Scalar LayerNorm and vector RMSNorm are applied separately. Normalization eps
-is for feature statistics only, never relative directions or quaternions.
-Geometry/search use FP32. CPU search is a slow debugging fallback.
-Register this module by importing it from pointcept.models.__init__.
+"""
+Joint Feature-Geometry SO(3) Quaternion Transport Network (replacement v2).
+
+Install as pointcept/models/so3_quaternion/so3_quaternion_transformer.py,
+replacing the old file. Keep its package __init__.py import. Both registry
+names SO3-QuatTransport-v1 and SO3-QuatTransport-v2 resolve to this new design;
+DefaultSegmentorV3SO3 retains deep supervision and paired consistency losses.
+Do not import the old and new files together (duplicate registry entries).
+
+TRAIN FROM SCRATCH: old checkpoints are not architecture compatible.
+
+Input contract: scalar_feature_indices must select ONLY invariant attributes,
+e.g. RGB. For feat=[x,y,z,r,g,b], use in_channels=6 and indices=(3,4,5).
+For feat=[r,g,b], use in_channels=3 and indices=(0,1,2). Vector feature groups
+may contain normals, which must rotate with coord. Never treat XYZ or fixed
+world-z height as invariant scalars. The model does not infer channel semantics.
+
+New operations:
+* metric + relative distance RBFs and covariance contractions;
+* feature-conditioned geometric stem, pooling, quaternion angles and values;
+* direct invariant edge messages into scalar values;
+* transported vector values plus direction and covariance-direction messages;
+* learned vector-channel dot products in invariant readout;
+* geometry cached per stage and query-chunked edge attention.
+
+geometry_scales are positive distance scales in the SAME UNITS as coord.
+Default scales assume meter coordinates: (0.1,0.2,0.4,0.8,1.6).
+edge_chunk_size controls temporary edge activations (default 1024); autograd
+still retains training activations across chunks. This is not a hard memory cap.
+Decoder defaults to enabled. Explicit use_decoder=False remains supported.
+Full SO(3) behavior applies to fixed input point sets; coordinate-axis voxel
+preprocessing, sampling ties and numerical roundoff can change neighborhoods.
+CUDA pointops is required for practical large-cloud training. CPU fallback is
+for small correctness tests. No S3DIS accuracy improvement has been measured.
 """
 
 from __future__ import annotations
@@ -48,26 +76,9 @@ def _batch_ranges(offset: torch.Tensor):
         start = end
 
 
-def _safe_unit(x: torch.Tensor):
-    # Exact piecewise normalization; safe denominator prevents 0/0 gradients.
+def _safe_unit(x: torch.Tensor, eps: float = 1e-8):
     norm = torch.linalg.vector_norm(x, dim=-1, keepdim=True)
-    denominator = torch.where(norm > 0, norm, torch.ones_like(norm))
-    return x / denominator, norm.squeeze(-1)
-
-
-def quaternion_exp(z):
-    """Rotation-vector exponential: [cos(|z|/2), sinc(|z|/(2pi))*z/2]."""
-    angle = torch.linalg.vector_norm(z, dim=-1, keepdim=True)
-    return torch.cos(angle / 2), 0.5 * torch.sinc(angle / (2 * math.pi)) * z
-
-
-def interpolation_weights(dist):
-    zero = dist == 0
-    has_zero = zero.any(-1, keepdim=True)
-    inv = 1 / torch.where(zero, torch.ones_like(dist), dist)
-    regular = inv / inv.sum(-1, keepdim=True)
-    exact = zero.to(dist.dtype) / zero.sum(-1, keepdim=True).clamp_min(1)
-    return torch.where(has_zero, exact, regular)
+    return x / norm.clamp_min(eps), norm.squeeze(-1)
 
 
 def _local_normalized_distance(dist: torch.Tensor, eps: float = 1e-6):
@@ -103,7 +114,7 @@ def _knn_fallback(
 
         for q0 in range(0, qry.shape[0], chunk_size):
             q = qry[q0:q0 + chunk_size]
-            d = torch.cdist(q.float(), src.float())
+            d = torch.cdist(q.float(), src.float(), compute_mode="donot_use_mm_for_euclid_dist")
             dist, idx = torch.topk(d, k=kk, dim=-1, largest=False, sorted=True)
 
             if kk < k:
@@ -137,7 +148,7 @@ def knn_query(
     new_xyz = new_xyz.contiguous()
     new_offset_i = new_offset.to(torch.int32).contiguous()
 
-    if pointops is None or not xyz.is_cuda:
+    if pointops is None or not xyz.is_cuda or bool((_offset_to_counts(offset) < k).any()):
         return _knn_fallback(xyz, offset, k, new_xyz, new_offset)
 
     errors = []
@@ -161,10 +172,11 @@ def knn_query(
                 else:
                     idx, dist = out, None
                 idx = idx.long()
-                if dist is None:
-                    rel = xyz[idx] - new_xyz[:, None, :]
-                    dist = torch.linalg.vector_norm(rel, dim=-1)
-                return idx, torch.linalg.vector_norm(xyz[idx] - new_xyz[:, None], dim=-1)
+                if (idx < 0).any():
+                    raise RuntimeError("pointops returned invalid neighbor indices")
+                rel = xyz[idx] - new_xyz[:, None, :]
+                dist = torch.linalg.vector_norm(rel, dim=-1)
+                return idx, dist.to(xyz.dtype)
             except (TypeError, RuntimeError) as exc:
                 errors.append(exc)
 
@@ -175,7 +187,11 @@ def knn_query(
             idx, dist = pointops.knnquery(
                 k, xyz, new_xyz, offset_i, new_offset_i
             )
-            return idx.long(), torch.linalg.vector_norm(xyz[idx.long()] - new_xyz[:, None], dim=-1)
+            idx = idx.long()
+            if (idx < 0).any():
+                raise RuntimeError("pointops returned invalid neighbor indices")
+            dist = torch.linalg.vector_norm(xyz[idx] - new_xyz[:, None, :], dim=-1)
+            return idx, dist.to(xyz.dtype)
         except (TypeError, RuntimeError) as exc:
             errors.append(exc)
 
@@ -212,7 +228,6 @@ def _fps_fallback(
             p = pts[chosen[t - 1]]
             d2 = ((pts - p) ** 2).sum(-1)
             min_d2 = torch.minimum(min_d2, d2)
-            min_d2[chosen[:t]] = -1
             chosen[t] = torch.argmax(min_d2)
 
         sampled.append(chosen + s)
@@ -285,10 +300,10 @@ class VectorRMSNorm(nn.Module):
     def forward(self, v: torch.Tensor) -> torch.Tensor:
         # RMS across vector channels, invariant to global 3D rotation.
         rms = torch.sqrt(
-            v.float().square().sum(-1).mean(-1, keepdim=True) + self.eps
+            v.square().sum(-1).mean(-1, keepdim=True) + self.eps
         )  # [..., 1]
         return (
-            v / rms.to(v.dtype).unsqueeze(-1)
+            v / rms.unsqueeze(-1)
             * self.weight.view(*([1] * (v.ndim - 2)), -1, 1)
         )
 
@@ -331,7 +346,7 @@ class ScalarFFN(nn.Module):
         hidden = int(channels * ratio)
         self.net = nn.Sequential(
             nn.Linear(channels, hidden),
-            nn.SiLU(),
+            nn.GELU(),
             nn.Dropout(drop),
             nn.Linear(hidden, channels),
             nn.Dropout(drop),
@@ -418,177 +433,174 @@ class SO3State:
     offset: torch.Tensor      # [B]
     sample_index: Optional[torch.Tensor] = None  # rows in ORIGINAL input batch
     pool_index: Optional[torch.Tensor] = None    # rows in preceding stage
+    geometry: Optional[dict] = None  # cached only for the current local graph
 
 
 # ---------------------------------------------------------------------------
 # Input embedding
 # ---------------------------------------------------------------------------
 
+def local_geometry(coord, idx, rbf, metric_scale, query=None, source_cov=None):
+    """Invariant descriptors and equivariant covariance, computed in FP32.
+
+    Uses second moments about each query (not a signed normal/eigenframe).
+    A zero-length/self edge is retained in attention but gives zero direction.
+    """
+    with torch.autocast(device_type=coord.device.type, enabled=False):
+        coord = coord.float()
+        query = coord if query is None else query.float()
+        rel = coord[idx] - query[:, None, :]
+        unit, dist = _safe_unit(rel)
+        radius = dist.amax(1, keepdim=True).clamp_min(1e-6)
+        cov = torch.einsum("nki,nkj->nij", rel, rel) / idx.shape[1]
+        trace = cov.diagonal(dim1=-2, dim2=-1).sum(-1)
+        cov = cov / trace.clamp_min(1e-8)[:, None, None]
+        cov2 = cov @ cov
+        t2 = cov2.diagonal(dim1=-2, dim2=-1).sum(-1)
+        t3 = (cov2 @ cov).diagonal(dim1=-2, dim2=-1).sum(-1)
+        cu = torch.einsum("nij,nkj->nki", cov, unit)
+        di = (unit * cu).sum(-1)
+        # For self graphs, cov is the source covariance as well.
+        neighbor_cov = cov[idx] if source_cov is None else source_cov[idx]
+        dj = torch.einsum("nki,nkij,nkj->nk", unit, neighbor_cov, unit)
+        extra = torch.stack([
+            torch.log1p(dist), torch.log1p(radius).expand_as(dist),
+            t2[:, None].expand_as(dist), t3[:, None].expand_as(dist), di, dj,
+        ], -1)
+        # Compress unbounded metric distances to [0,1), avoiding RBF extinction.
+        metric = dist / (dist + float(metric_scale))
+        edge = torch.cat([rbf(metric), rbf(dist / radius), extra], -1)
+    return dict(edge=edge, unit=unit, cov=cov, cu=cu, dist=dist)
+
+
 class LocalEquivariantStem(nn.Module):
-    """
-    Build initial vector neurons from local relative displacement.
-
-    For each point i:
-        V_i[c] = mean_j phi_c(RBF(d), S_i, S_j, S_j-S_i) * r_ij
-
-    The scalar coefficient is invariant; u_ij is equivariant.
-    """
-    def __init__(
-        self,
-        scalar_in: int,
-        scalar_out: int,
-        vector_out: int,
-        k: int = 16,
-        rbf_dim: int = 16,
-        input_vector_groups: int = 0,
-    ):
+    """Joint feature/shape stem with invariant scalar and equivariant vector output."""
+    def __init__(self, scalar_in, scalar_out, vector_out, k=16, rbf_dim=16,
+                 input_vector_groups=0):
         super().__init__()
-        self.k = k
-        self.scalar = nn.Sequential(
-            nn.Linear(scalar_in, scalar_out),
-            nn.LayerNorm(scalar_out),
-            nn.SiLU(),
-        )
+        self.k, self.metric_scale, self.chunk_size = k, 0.1, 1024
         self.rbf = GaussianRBF(rbf_dim)
-        self.geo_coeff = nn.Sequential(
-            nn.Linear(rbf_dim + 3 * scalar_out, max(vector_out, 32)),
-            nn.SiLU(),
-            nn.Linear(max(vector_out, 32), vector_out),
-        )
-        self.input_vector_proj = (
-            EquivariantLinear(input_vector_groups, vector_out)
-            if input_vector_groups > 0 else None
-        )
+        width = min(64, scalar_out)
+        self.scalar = nn.Linear(scalar_in, scalar_out)
+        self.edge = nn.Sequential(nn.Linear(2 * scalar_in + 2 * rbf_dim + 6, width),
+                                  nn.SiLU(), nn.Linear(width, width), nn.SiLU())
+        self.score = nn.Linear(width, 1)
+        self.scalar_value = nn.Linear(width, scalar_out)
+        self.vector_value = nn.Linear(width, 2 * vector_out)
+        self.snorm = nn.LayerNorm(scalar_out)
         self.vnorm = VectorRMSNorm(vector_out)
         self.vact = VectorGatedSiLU(vector_out, scalar_out)
+        self.input_vector_proj = (EquivariantLinear(input_vector_groups, vector_out)
+                                  if input_vector_groups else None)
 
-    def forward(
-        self,
-        coord: torch.Tensor,
-        scalar_feat: torch.Tensor,
-        offset: torch.Tensor,
-        vector_feat: Optional[torch.Tensor] = None,
-    ) -> SO3State:
-        s = self.scalar(scalar_feat)
-
-        idx, dist = knn_query(coord, offset, self.k)
-        rel = coord[idx] - coord[:, None, :]
-        unit, raw_dist = _safe_unit(rel)
-        valid = (raw_dist > 0).to(unit.dtype)
-
-        d = _local_normalized_distance(dist)
-        si = s[:, None].expand(-1, idx.shape[1], -1)
-        sj = s[idx]
-        coeff = self.geo_coeff(torch.cat([self.rbf(d), si, sj, sj-si], -1))
-        coeff = coeff * valid.unsqueeze(-1)
-
-        v = (
-            coeff.unsqueeze(-1) * rel.unsqueeze(-2)
-        ).mean(dim=1)
-
+    def forward(self, coord, scalar_feat, offset, vector_feat=None):
+        idx, _ = knn_query(coord, offset, self.k)
+        geo = local_geometry(coord, idx, self.rbf, self.metric_scale)
+        ss, vv = [], []
+        for start in range(0, len(coord), self.chunk_size):
+            end = min(start + self.chunk_size, len(coord))
+            ids = idx[start:end]
+            center = scalar_feat[start:end, None].expand(-1, ids.shape[1], -1)
+            edge = self.edge(torch.cat([center, scalar_feat[ids] - center,
+                                       geo['edge'][start:end].to(scalar_feat.dtype)], -1))
+            weight = self.score(edge).float().softmax(1)
+            ss.append((weight * self.scalar_value(edge)).sum(1))
+            a, b = self.vector_value(edge).chunk(2, -1)
+            value = (a[..., None] * geo['unit'][start:end, :, None]
+                     + b[..., None] * geo['cu'][start:end, :, None])
+            vv.append((weight[..., None] * value).sum(1))
+        s = F.gelu(self.snorm(self.scalar(scalar_feat) + torch.cat(ss)))
+        v = torch.cat(vv)
         if vector_feat is not None and self.input_vector_proj is not None:
             v = v + self.input_vector_proj(vector_feat)
-
         v = self.vact(self.vnorm(v), s)
-        return SO3State(
-            coord=coord.float(), scalar=s, vector=v, offset=offset,
-            sample_index=torch.arange(coord.shape[0], device=coord.device),
-        )
+        return SO3State(coord, s, v, offset,
+                        sample_index=torch.arange(len(coord), device=coord.device))
 
-
-# ---------------------------------------------------------------------------
-# Relative Quaternion Transport Attention
-# ---------------------------------------------------------------------------
 
 class RelativeQuaternionTransportAttention(nn.Module):
-    """Invariant local attention with per-head equivariant quaternion transport."""
-    def __init__(self, scalar_channels, vector_channels, num_heads,
-                 rbf_dim=16, attn_drop=0., quaternion_geometry="relational",
-                 include_qk_alignment=False, transport_mode="symmetric_qk",
-                 transport_value=False, scalar_attention=True, beta_max=math.pi,
-                 qk_normalization=True):
+    """Joint invariant edge attention with geometric scalar/vector VALUES.
+
+    No component-wise nonlinearities or biases are applied to 3-vectors.
+    Query chunking reduces peak eager temporary tensors; training still saves
+    activations for all chunks. Each head normalizes over its neighbors.
+    """
+    def __init__(self, scalar_channels, vector_channels, num_heads, rbf_dim=16,
+                 attn_drop=0.0, max_angle=math.pi):
         super().__init__()
         if scalar_channels % num_heads or vector_channels % num_heads:
-            raise ValueError("Scalar/vector channels must be divisible by heads")
-        if quaternion_geometry not in ("relational", "distance"):
-            raise ValueError("Invalid quaternion_geometry")
-        if transport_mode not in ("symmetric_qk", "k_only"):
-            raise ValueError("Invalid transport_mode")
-        if not math.isfinite(beta_max) or beta_max <= 0:
-            raise ValueError("beta_max must be finite and positive")
-        self.cs, self.cv, self.h = scalar_channels, vector_channels, num_heads
+            raise ValueError('Scalar/vector channels must be divisible by heads')
+        self.scalar_channels, self.vector_channels = scalar_channels, vector_channels
+        self.num_heads = num_heads
         self.ds, self.dv = scalar_channels // num_heads, vector_channels // num_heads
-        self.geometry, self.alignment = quaternion_geometry, include_qk_alignment
-        self.mode, self.transport_value = transport_mode, transport_value
-        self.scalar_attention, self.beta_max = scalar_attention, beta_max
+        self.max_angle, self.metric_scale, self.chunk_size = max_angle, 0.1, 1024
+        width, geom_v = min(64, scalar_channels), min(16, vector_channels)
+        self.edge_scalar = nn.Linear(scalar_channels, width)
+        self.edge_vector = EquivariantLinear(vector_channels, geom_v)
+        self.edge = nn.Sequential(nn.Linear(2*width + 3*geom_v + 2*rbf_dim + 6, width),
+                                  nn.SiLU(), nn.Linear(width, width), nn.SiLU())
+        self.qs = nn.Linear(scalar_channels, scalar_channels, bias=False)
+        self.ks = nn.Linear(scalar_channels, scalar_channels, bias=False)
+        self.vs = nn.Linear(scalar_channels, scalar_channels, bias=False)
         self.qv = EquivariantLinear(vector_channels, vector_channels)
         self.kv = EquivariantLinear(vector_channels, vector_channels)
         self.vv = EquivariantLinear(vector_channels, vector_channels)
-        self.qnorm = VectorRMSNorm(self.dv) if qk_normalization else nn.Identity()
-        self.knorm = VectorRMSNorm(self.dv) if qk_normalization else nn.Identity()
-        self.vs = nn.Linear(scalar_channels, scalar_channels, bias=False)
-        if scalar_attention:
-            self.qs = nn.Linear(scalar_channels, scalar_channels, bias=False)
-            self.ks = nn.Linear(scalar_channels, scalar_channels, bias=False)
-            self.qsnorm = nn.LayerNorm(self.ds) if qk_normalization else nn.Identity()
-            self.ksnorm = nn.LayerNorm(self.ds) if qk_normalization else nn.Identity()
-        # g contains RAW distance and per-channel directional projections.
-        # RBF(normalized distance) supplements g; it does not replace raw d.
-        self.rbf = GaussianRBF(rbf_dim)
-        dim = 1 + rbf_dim + (2 * self.dv if quaternion_geometry == "relational" else 0)
-        dim += self.dv if include_qk_alignment else 0
-        self.generators = nn.ModuleList([nn.Sequential(nn.Linear(dim, 32), nn.SiLU(),
-                                                      nn.Linear(32, 2)) for _ in range(num_heads)])
+        self.edge_key = nn.Linear(width, scalar_channels, bias=False)
+        self.edge_value = nn.Linear(width, scalar_channels, bias=False)
+        self.angle_mlp = nn.Linear(width, num_heads)
+        self.bias_mlp = nn.Linear(width, num_heads)
+        self.vector_coeff = nn.Linear(width, 3 * vector_channels)
+        self.vector_score_scale = nn.Parameter(torch.ones(num_heads))
         self.scalar_out = nn.Linear(scalar_channels, scalar_channels)
         self.vector_out = EquivariantLinear(vector_channels, vector_channels)
         self.attn_drop = nn.Dropout(attn_drop)
+        self.rbf = GaussianRBF(rbf_dim)
 
     def forward(self, state, idx, dist):
-        s, v, coord = state.scalar, state.vector, state.coord
+        s, v = state.scalar, state.vector
         n, k = idx.shape
-        q = self.qnorm(self.qv(v).reshape(n, self.h, self.dv, 3))
-        key = self.knorm(self.kv(v).reshape(n, self.h, self.dv, 3))[idx]
-        values = self.vv(v).reshape(n, self.h, self.dv, 3)[idx]
-        # Geometry, descriptor, exp, and logits remain FP32 under autocast.
-        with torch.autocast(device_type=coord.device.type, enabled=False):
-            rel = coord.float()[idx] - coord.float()[:, None]
-            direction, distance = _safe_unit(rel)
-            qe = q.float()[:, None].expand(-1, k, -1, -1, -1)
-            key = key.float()
-            radial = torch.cat([distance[..., None], self.rbf(_local_normalized_distance(distance))], -1)
-            parts = [radial[:, :, None].expand(-1, -1, self.h, -1)]
-            if self.geometry == "relational":
-                axis = direction[:, :, None, None]
-                parts.extend([(qe * axis).sum(-1), (key * axis).sum(-1)])
-            if self.alignment:
-                parts.append((qe * key).sum(-1))
-            g = torch.cat(parts, -1)
-            parameters = torch.stack([net(g[:, :, h]) for h, net in enumerate(self.generators)], 2)
-            beta = self.beta_max * torch.tanh(parameters[..., 0])
-            z = beta[..., None] * rel[:, :, None]
-            if self.mode == "symmetric_qk":
-                qw, qvec = quaternion_exp(-z / 2)
-                qt = quaternion_rotate(qe, qw, qvec)
-                kw, kvec = quaternion_exp(z / 2)
-            else:
-                qt = qe
-                kw, kvec = quaternion_exp(z)
-            kt = quaternion_rotate(key, kw, kvec)
-            logits = (qt * kt).sum((-1, -2)) / math.sqrt(self.dv)
-            logits = logits + parameters[..., 1]
-            if self.scalar_attention:
-                qs = self.qsnorm(self.qs(s.float()).reshape(n, self.h, self.ds))
-                ks = self.ksnorm(self.ks(s.float()).reshape(n, self.h, self.ds))[idx]
-                logits = logits + (qs[:, None] * ks).sum(-1) / math.sqrt(self.ds)
-            weights = self.attn_drop(logits.softmax(1))
-            if self.transport_value:
-                # Value ablation uses full neighbor-to-center transport +z.
-                vw, vvec = quaternion_exp(z)
-                values = quaternion_rotate(values, vw, vvec)
-            out_v = (weights[..., None, None] * values.float()).sum(1).reshape(n, self.cv, 3)
-        sv = self.vs(s).reshape(n, self.h, self.ds)[idx]
-        out_s = (weights[..., None] * sv).sum(1).reshape(n, self.cs)
-        return self.scalar_out(out_s), self.vector_out(out_v)
+        h, ds, dv = self.num_heads, self.ds, self.dv
+        geo = state.geometry
+        if geo is None:
+            geo = local_geometry(state.coord, idx, self.rbf, self.metric_scale)
+        fs, fv = self.edge_scalar(s), self.edge_vector(v).float()
+        qs = self.qs(s).reshape(n, h, ds)
+        ks = self.ks(s).reshape(n, h, ds)
+        vs = self.vs(s).reshape(n, h, ds)
+        # Normalize vector Q/K to bound score magnitudes independently of channels.
+        qv = F.normalize(self.qv(v).float().reshape(n, h, dv*3), dim=-1).reshape(n,h,dv,3)
+        kv = F.normalize(self.kv(v).float().reshape(n, h, dv*3), dim=-1).reshape(n,h,dv,3)
+        vv = self.vv(v).reshape(n, h, dv, 3)
+        output_s, output_v = [], []
+        for start in range(0, n, self.chunk_size):
+            end = min(start+self.chunk_size, n)
+            ids, unit = idx[start:end], geo['unit'][start:end]
+            center = fs[start:end, None].expand(-1, k, -1)
+            vi, vj = fv[start:end, None], fv[ids]
+            invariant = torch.cat([(vi*unit[:,:,None]).sum(-1),
+                                   (vj*unit[:,:,None]).sum(-1), (vi*vj).sum(-1)], -1)
+            edge = self.edge(torch.cat([center, fs[ids]-center,
+                                       geo['edge'][start:end].to(center.dtype),
+                                       invariant.to(center.dtype)], -1))
+            theta = self.max_angle * torch.tanh(self.angle_mlp(edge).float())
+            theta = theta * (geo['dist'][start:end] > 1e-8)[..., None]
+            qw = torch.cos(theta/2)[..., None]
+            qvec = unit[:,:,None] * torch.sin(theta/2)[...,None]
+            kt = quaternion_rotate(kv[ids], qw, qvec)
+            ek = self.edge_key(edge).reshape(end-start,k,h,ds)
+            logits = (qs[start:end,None].float() * (ks[ids]+ek).float()).sum(-1) / math.sqrt(ds)
+            logits = logits + (qv[start:end,None]*kt).sum((-1,-2)) * self.vector_score_scale
+            logits = logits + self.bias_mlp(edge).float()
+            weight = self.attn_drop(logits.softmax(1))
+            value_s = vs[ids] + self.edge_value(edge).reshape(end-start,k,h,ds)
+            output_s.append((weight[...,None]*value_s).sum(1).reshape(end-start,-1))
+            coeff = self.vector_coeff(edge).reshape(end-start,k,3,h,dv).float()
+            a, b, c = coeff.unbind(2)
+            value_v = ((1 + torch.tanh(a))[...,None] * quaternion_rotate(vv[ids],qw,qvec)
+                       + b[...,None]*unit[:,:,None,None]
+                       + c[...,None]*geo['cu'][start:end,:,None,None])
+            output_v.append((weight[...,None,None]*value_v).sum(1).reshape(end-start,-1,3))
+        return self.scalar_out(torch.cat(output_s)), self.vector_out(torch.cat(output_v))
 
 
 class SO3QuaternionBlock(nn.Module):
@@ -602,7 +614,6 @@ class SO3QuaternionBlock(nn.Module):
         rbf_dim: int = 16,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        **attention_options,
     ):
         super().__init__()
         self.snorm1 = nn.LayerNorm(scalar_channels)
@@ -613,7 +624,6 @@ class SO3QuaternionBlock(nn.Module):
             num_heads,
             rbf_dim=rbf_dim,
             attn_drop=attn_drop,
-            **attention_options,
         )
 
         self.snorm2 = nn.LayerNorm(scalar_channels)
@@ -633,6 +643,7 @@ class SO3QuaternionBlock(nn.Module):
             scalar=self.snorm1(state.scalar),
             vector=self.vnorm1(state.vector),
             offset=state.offset,
+            geometry=state.geometry,
         )
         ds, dv = self.attn(norm_state, idx, dist)
         s = state.scalar + ds
@@ -662,10 +673,11 @@ class SO3LocalStage(nn.Module):
         rbf_dim: int = 16,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        **attention_options,
     ):
         super().__init__()
         self.k = k
+        self.metric_scale = 0.1
+        self.rbf = GaussianRBF(rbf_dim)
         self.blocks = nn.ModuleList([
             SO3QuaternionBlock(
                 scalar_channels,
@@ -676,7 +688,6 @@ class SO3LocalStage(nn.Module):
                 rbf_dim=rbf_dim,
                 attn_drop=attn_drop,
                 proj_drop=proj_drop,
-                **attention_options,
             )
             for _ in range(depth)
         ])
@@ -685,6 +696,8 @@ class SO3LocalStage(nn.Module):
         idx, dist = knn_query(
             state.coord, state.offset, self.k
         )
+        state = replace(state, geometry=local_geometry(
+            state.coord, idx, self.rbf, self.metric_scale))
         for block in self.blocks:
             state = block(state, idx, dist)
         return state
@@ -695,104 +708,65 @@ class SO3LocalStage(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SO3FPSDownsample(nn.Module):
-    """
-    FPS + local invariant-weighted pooling.
-
-    The selected coordinates rotate with the input. Neighbor selection depends
-    on Euclidean distances only. Scalar pooling weights are invariant.
-    """
-    def __init__(
-        self,
-        scalar_in: int,
-        scalar_out: int,
-        vector_in: int,
-        vector_out: int,
-        ratio: float = 0.25,
-        k: int = 16,
-        rbf_dim: int = 16,
-    ):
+    """FPS with feature-conditioned channel-wise scalar pooling and vector pooling."""
+    def __init__(self, scalar_in, scalar_out, vector_in, vector_out,
+                 ratio=0.25, k=16, rbf_dim=16):
         super().__init__()
-        if not (0.0 < ratio <= 1.0):
-            raise ValueError("ratio must be in (0, 1]")
-        self.ratio = ratio
-        self.k = k
+        if not 0 < ratio <= 1:
+            raise ValueError('ratio must lie in (0,1]')
+        self.ratio, self.k = ratio, k
+        self.metric_scale, self.chunk_size = 0.1, 1024
         self.rbf = GaussianRBF(rbf_dim)
-
+        width = min(64, scalar_out)
+        self.feature = nn.Linear(scalar_in, width)
+        self.edge = nn.Sequential(nn.Linear(2*width + 2*rbf_dim+6, width),
+                                  nn.SiLU(), nn.Linear(width,width), nn.SiLU())
         self.scalar_proj = nn.Linear(scalar_in, scalar_out)
         self.vector_proj = EquivariantLinear(vector_in, vector_out)
-
-        self.weight_mlp = nn.Sequential(
-            nn.Linear(rbf_dim, max(32, scalar_out // 2)),
-            nn.SiLU(),
-            nn.Linear(max(32, scalar_out // 2), 1),
-        )
-
-        # Geometry can create new vector information at every transition.
-        self.geo_mlp = nn.Sequential(
-            nn.Linear(rbf_dim, max(32, vector_out)),
-            nn.SiLU(),
-            nn.Linear(max(32, vector_out), vector_out),
-        )
-
+        self.scalar_weight = nn.Linear(width, scalar_out)
+        self.scalar_value = nn.Linear(width, scalar_out)
+        self.vector_weight = nn.Linear(width, vector_out)
+        self.vector_geo = nn.Linear(width, 2*vector_out)
         self.snorm = nn.LayerNorm(scalar_out)
         self.vnorm = VectorRMSNorm(vector_out)
         self.vact = VectorGatedSiLU(vector_out, scalar_out)
 
-    def forward(self, state: SO3State, sample_idx=None):
+    def forward(self, state, sample_idx=None):
         counts = _offset_to_counts(state.offset)
-        new_counts = torch.ceil(
-            counts.float() * self.ratio
-        ).long().clamp_min(1)
-        new_offset = _counts_to_offset(
-            new_counts, dtype=state.offset.dtype
-        )
-
+        new_counts = torch.ceil(counts.float()*self.ratio).long().clamp_min(1)
+        new_offset = _counts_to_offset(new_counts, dtype=state.offset.dtype)
         if sample_idx is None:
-            sample_idx = farthest_point_sampling(
-                state.coord, state.offset, new_offset
-            )
-        new_coord = state.coord[sample_idx]
-
-        idx, dist = knn_query(
-            state.coord,
-            state.offset,
-            self.k,
-            new_xyz=new_coord,
-            new_offset=new_offset,
-        )
-
-        d = _local_normalized_distance(dist)
-        rbf = self.rbf(d)
-        w = F.softmax(self.weight_mlp(rbf).squeeze(-1), dim=1)
-
-        s_neighbor = self.scalar_proj(state.scalar[idx])
-        v_neighbor = self.vector_proj(state.vector[idx])
-
-        s = (w.unsqueeze(-1) * s_neighbor).sum(1)
-        v = (w.unsqueeze(-1).unsqueeze(-1) * v_neighbor).sum(1)
-
-        rel = state.coord[idx] - new_coord[:, None, :]
-        unit, raw_dist = _safe_unit(rel)
-        valid = (raw_dist > 0).to(unit.dtype)
-
-        geo = self.geo_mlp(rbf) * valid.unsqueeze(-1)
-        v_geo = (
-            w.unsqueeze(-1).unsqueeze(-1)
-            * geo.unsqueeze(-1)
-            * unit.unsqueeze(-2)
-        ).sum(1)
-
-        v = v + v_geo
-        s = self.snorm(s)
-        v = self.vact(self.vnorm(v), s)
-
-        original_index = state.sample_index
-        if original_index is None:
-            raise ValueError("Downsampling requires original-input sample_index.")
-        return SO3State(
-            new_coord, s, v, new_offset,
-            sample_index=original_index[sample_idx], pool_index=sample_idx,
-        )
+            sample_idx = farthest_point_sampling(state.coord, state.offset, new_offset)
+        coord = state.coord[sample_idx]
+        idx, _ = knn_query(state.coord,state.offset,self.k,coord,new_offset)
+        if state.geometry is None:
+            src_idx, _ = knn_query(state.coord,state.offset,self.k)
+            source_cov = local_geometry(state.coord,src_idx,self.rbf,self.metric_scale)['cov']
+        else:
+            source_cov = state.geometry['cov']
+        geo = local_geometry(state.coord,idx,self.rbf,self.metric_scale,
+                             query=coord,source_cov=source_cov)
+        feat = self.feature(state.scalar)
+        sp, vp = self.scalar_proj(state.scalar), self.vector_proj(state.vector)
+        ss, vv = [], []
+        for start in range(0,len(coord),self.chunk_size):
+            end = min(start+self.chunk_size,len(coord))
+            ids = idx[start:end]
+            center = feat[sample_idx[start:end],None].expand(-1,ids.shape[1],-1)
+            e = self.edge(torch.cat([center,feat[ids]-center,
+                                     geo['edge'][start:end].to(center.dtype)],-1))
+            ws = self.scalar_weight(e).float().softmax(1)
+            wv = self.vector_weight(e).float().softmax(1)
+            ss.append((ws*(sp[ids]+self.scalar_value(e))).sum(1))
+            a,b = self.vector_geo(e).chunk(2,-1)
+            value = vp[ids] + a[...,None]*geo['unit'][start:end,:,None] + b[...,None]*geo['cu'][start:end,:,None]
+            vv.append((wv[...,None]*value).sum(1))
+        s = F.gelu(self.snorm(torch.cat(ss)))
+        v = self.vact(self.vnorm(torch.cat(vv)),s)
+        if state.sample_index is None:
+            raise ValueError('Downsampling requires sample_index')
+        return SO3State(coord,s,v,new_offset,
+                        sample_index=state.sample_index[sample_idx],pool_index=sample_idx)
 
 
 class SO3UpsampleFusion(nn.Module):
@@ -817,7 +791,7 @@ class SO3UpsampleFusion(nn.Module):
         self.scalar_fuse = nn.Sequential(
             nn.Linear(2 * out_scalar, out_scalar),
             nn.LayerNorm(out_scalar),
-            nn.SiLU(),
+            nn.GELU(),
         )
 
         self.coarse_v = EquivariantLinear(coarse_vector, out_vector)
@@ -834,7 +808,8 @@ class SO3UpsampleFusion(nn.Module):
             new_xyz=skip.coord,
             new_offset=skip.offset,
         )
-        w = interpolation_weights(dist)
+        inv = 1.0 / dist.clamp_min(1e-8)
+        w = inv / inv.sum(-1, keepdim=True)
 
         cs = self.coarse_s(coarse.scalar)
         cv = self.coarse_v(coarse.vector)
@@ -854,7 +829,7 @@ class SO3UpsampleFusion(nn.Module):
         )
         v = self.vact(self.vnorm(v), s)
 
-        return replace(skip, scalar=s, vector=v)
+        return replace(skip, scalar=s, vector=v, geometry=None)
 
 
 # ---------------------------------------------------------------------------
@@ -862,31 +837,22 @@ class SO3UpsampleFusion(nn.Module):
 # ---------------------------------------------------------------------------
 
 class SO3InvariantProjection(nn.Module):
-    """
-    Convert equivariant vectors to invariant scalars using norms and fuse them
-    with the scalar stream.
-    """
-    def __init__(
-        self,
-        scalar_channels: int,
-        vector_channels: int,
-        out_channels: int,
-    ):
+    """Norms plus learned bilinear vector invariants retain channel relationships."""
+    def __init__(self, scalar_channels, vector_channels, out_channels):
         super().__init__()
-        self.scalar_norm = nn.LayerNorm(scalar_channels)
-        self.norm_feature_norm = nn.LayerNorm(vector_channels)
-        self.net = nn.Sequential(
-            nn.Linear(scalar_channels + vector_channels, out_channels),
-            nn.LayerNorm(out_channels),
-            nn.SiLU(),
-            nn.Linear(out_channels, out_channels),
-            nn.LayerNorm(out_channels),
-            nn.SiLU(),
-        )
+        self.left = EquivariantLinear(vector_channels, vector_channels)
+        self.right = EquivariantLinear(vector_channels, vector_channels)
+        self.net = nn.Sequential(nn.Linear(scalar_channels+2*vector_channels,out_channels),
+                                 nn.LayerNorm(out_channels), nn.GELU(),
+                                 nn.Linear(out_channels,out_channels),
+                                 nn.LayerNorm(out_channels), nn.GELU())
 
-    def forward(self, state: SO3State):
-        vn = torch.linalg.vector_norm(state.vector, dim=-1)
-        return self.net(torch.cat([self.scalar_norm(state.scalar), self.norm_feature_norm(vn)], dim=-1))
+    def forward(self,state):
+        norm = torch.linalg.vector_norm(state.vector.float(),dim=-1)
+        dot = (self.left(state.vector).float()*self.right(state.vector).float()).sum(-1)
+        # Smooth compression for large bilinear features.
+        dot = torch.asinh(dot)
+        return self.net(torch.cat([state.scalar,norm,dot],-1))
 
 
 class SO3EncoderOnlyHead(nn.Module):
@@ -915,7 +881,7 @@ class SO3EncoderOnlyHead(nn.Module):
         self.out = nn.Sequential(
             nn.Linear(out_channels, out_channels),
             nn.LayerNorm(out_channels),
-            nn.SiLU(),
+            nn.GELU(),
         )
 
     def forward(self, stages: Sequence[SO3State]):
@@ -935,7 +901,8 @@ class SO3EncoderOnlyHead(nn.Module):
                     new_xyz=target.coord,
                     new_offset=target.offset,
                 )
-                w = interpolation_weights(dist)
+                inv = 1.0 / dist.clamp_min(1e-8)
+                w = inv / inv.sum(-1, keepdim=True)
                 up = (w.unsqueeze(-1) * feat[idx]).sum(1)
 
             values.append(scale_w[i] * up)
@@ -947,13 +914,15 @@ class SO3EncoderOnlyHead(nn.Module):
 # Backbone
 # ---------------------------------------------------------------------------
 
+@MODELS.register_module("SO3-QuatTransport-v2")
 @MODELS.register_module("SO3-QuatTransport-v1")
 class SO3QuaternionTransportNet(nn.Module):
     """
     Hierarchical SO(3)-equivariant quaternion transport backbone.
 
-    Defaults intentionally resemble the stage structure of ptwno.py while
-    replacing serialized attention, sparse CPE, and Cartesian Haar-WNO.
+    Joint feature/geometry edge embeddings control attention keys, values,
+    quaternion angles and pooling. Decoder is enabled by default.
+    Registry v1 is a configuration alias, NOT checkpoint compatibility.
     """
     def __init__(
         self,
@@ -979,7 +948,7 @@ class SO3QuaternionTransportNet(nn.Module):
         proj_drop: float = 0.0,
 
         # Decoder / output
-        use_decoder: bool = False,
+        use_decoder: bool = True,
         decoder_depths: Sequence[int] = (2, 2, 2, 2),
         decoder_scalar_channels: Sequence[int] = (64, 64, 128, 256),
         decoder_vector_channels: Sequence[int] = (32, 32, 64, 128),
@@ -987,20 +956,11 @@ class SO3QuaternionTransportNet(nn.Module):
         decoder_neighbors: Sequence[int] = (16, 16, 24, 24),
         head_channels: int = 64,
         interp_k: int = 3,
-        quaternion_geometry="relational",
-        include_qk_alignment=False,
-        transport_mode="symmetric_qk",
-        transport_value=False,
-        scalar_attention=True,
-        beta_max=math.pi,
-        qk_normalization=True,
+        geometry_scales: Optional[Sequence[float]] = None,
+        edge_chunk_size: int = 1024,
     ):
         super().__init__()
 
-        attention_options = dict(quaternion_geometry=quaternion_geometry,
-            include_qk_alignment=include_qk_alignment, transport_mode=transport_mode,
-            transport_value=transport_value, scalar_attention=scalar_attention,
-            beta_max=beta_max, qk_normalization=qk_normalization)
         nstages = len(enc_depths)
         if not (
             nstages
@@ -1092,7 +1052,6 @@ class SO3QuaternionTransportNet(nn.Module):
                     rbf_dim=rbf_dim,
                     attn_drop=attn_drop,
                     proj_drop=proj_drop,
-                    **attention_options,
                 )
             )
 
@@ -1163,7 +1122,6 @@ class SO3QuaternionTransportNet(nn.Module):
                         rbf_dim=rbf_dim,
                         attn_drop=attn_drop,
                         proj_drop=proj_drop,
-                        **attention_options,
                     )
                 )
                 current_s, current_v = out_s, out_v
@@ -1171,6 +1129,28 @@ class SO3QuaternionTransportNet(nn.Module):
             self.final_invariant = SO3InvariantProjection(
                 current_s, current_v, head_channels
             )
+
+        scales = ([0.1 * 2**i for i in range(nstages)] if geometry_scales is None
+                  else list(geometry_scales))
+        if len(scales) != nstages or any(not math.isfinite(x) or x <= 0 for x in scales):
+            raise ValueError('geometry_scales must have one finite positive value per encoder stage')
+        if not isinstance(edge_chunk_size, int) or edge_chunk_size < 1:
+            raise ValueError('edge_chunk_size must be a positive integer')
+        self.stem.metric_scale = scales[0]
+        for i, stage in enumerate(self.stages):
+            stage.metric_scale = scales[i]
+            for block in stage.blocks:
+                block.attn.metric_scale = scales[i]
+        for i, down in enumerate(self.down):
+            down.metric_scale = scales[i+1]
+        if self.use_decoder:
+            for stage, i in zip(self.dec_stages, reversed(range(nstages-1))):
+                stage.metric_scale = scales[i]
+                for block in stage.blocks:
+                    block.attn.metric_scale = scales[i]
+        for module in self.modules():
+            if hasattr(module, 'chunk_size'):
+                module.chunk_size = edge_chunk_size
 
     def _split_input_features(self, feat: torch.Tensor):
         s = feat.index_select(1, self._scalar_indices.to(feat.device))
@@ -1298,7 +1278,6 @@ class DefaultSegmentorV3SO3(nn.Module):
         aux_stage_weights=None,
         aux_criteria=None,
         equivariance_regularization=False,
-        equivariance_loss=None,
         equivariance_weight=0.01,
         invariance_regularization=False,
         invariance_weight=0.01,
@@ -1306,8 +1285,6 @@ class DefaultSegmentorV3SO3(nn.Module):
         consistency_detach_target=False,
     ):
         super().__init__()
-        if equivariance_loss is not None:
-            equivariance_regularization = bool(equivariance_loss)
         self.backbone = build_model(backbone)
         self.seg_head = nn.Linear(backbone_out_channels, num_classes)
         self.criteria = build_criteria(criteria)
@@ -1359,7 +1336,7 @@ class DefaultSegmentorV3SO3(nn.Module):
                 self.aux_stage_weights,
             )):
                 if weight > 0:
-                    self.aux_heads[str(i)] = nn.Sequential(nn.LayerNorm(s + v), nn.Linear(s + v, num_classes))
+                    self.aux_heads[str(i)] = nn.Linear(s + v, num_classes)
 
         if freeze_backbone:
             for p in self.backbone.parameters():
@@ -1498,3 +1475,59 @@ class DefaultSegmentorV3SO3(nn.Module):
         if return_point:
             output["point"] = point
         return output
+
+
+def validate_so3_model(device="cpu"):
+    """Small forward/backward and rotation check using actual installed backends.
+
+    Call after importing this module within your Pointcept environment:
+        print(validate_so3_model("cuda"))
+    CPU uses the debug kNN/FPS fallback. CUDA uses installed pointops where
+    neighborhood sizes permit. Tests both decoder and encoder-only modes.
+    This is a correctness smoke test, not a segmentation benchmark.
+    """
+    device = torch.device(device)
+    torch.manual_seed(1234)
+    coord = torch.randn(80, 3, device=device)
+    feat = torch.randn(80, 6, device=device)  # RGB followed by a true vector
+    offset = torch.tensor([40, 80], dtype=torch.int32, device=device)
+    data = dict(coord=coord, feat=feat, offset=offset)
+    rotation = _random_so3(device)
+    rotated = dict(coord=coord @ rotation.T,
+                   feat=torch.cat([feat[:, :3], feat[:, 3:] @ rotation.T], -1),
+                   offset=offset)
+    report = {}
+    for decoder in (False, True):
+        model = SO3QuaternionTransportNet(
+            in_channels=6, scalar_feature_indices=(0, 1, 2),
+            vector_feature_groups=((3, 4, 5),),
+            enc_depths=(1, 1), scalar_channels=(16, 32),
+            vector_channels=(8, 16), num_heads=(2, 4), neighbors=(8, 8),
+            sample_ratios=(0.5,), use_decoder=decoder,
+            decoder_depths=(1,), decoder_scalar_channels=(16,),
+            decoder_vector_channels=(8,), decoder_heads=(2,),
+            decoder_neighbors=(8,), head_channels=16, edge_chunk_size=17,
+        ).to(device).eval()
+        with torch.no_grad():
+            original, states = model(data, return_stages=True)
+            transformed, rotated_states = model(rotated, return_stages=True)
+            torch.testing.assert_close(original.feat, transformed.feat,
+                                       atol=5e-4, rtol=5e-4)
+            for state, rotated_state in zip(states, rotated_states):
+                torch.testing.assert_close(state.scalar, rotated_state.scalar,
+                                           atol=5e-4, rtol=5e-4)
+                torch.testing.assert_close(state.vector @ rotation.T,
+                                           rotated_state.vector,
+                                           atol=5e-4, rtol=5e-4)
+            error = (original.feat - transformed.feat).abs().max().item()
+        model.train()
+        output = model(data).feat
+        assert torch.isfinite(output).all(), "Nonfinite output"
+        output.square().mean().backward()
+        for name, parameter in model.named_parameters():
+            assert parameter.grad is not None, f"Missing gradient: {name}"
+            assert torch.isfinite(parameter.grad).all(), f"Nonfinite gradient: {name}"
+        report["decoder" if decoder else "encoder_only"] = {
+            "max_rotation_error": error, "backward": "passed",
+        }
+    return report

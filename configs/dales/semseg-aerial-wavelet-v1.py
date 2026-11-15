@@ -3,10 +3,11 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 2
+batch_size = 6
 num_worker = 24
 mix_prob = 0.8
 empty_cache = True
+empty_cache_per_epoch = True
 enable_amp = True
 amp_dtype = "bfloat16"
 clip_grad = 3.0
@@ -34,7 +35,7 @@ model = dict(
     backbone=dict(
         type="PT-v3m1-QWNO-Redesigned",
         in_channels=4,
-        order=("z", "z-trans", "hilbert", "hilbert-trans"),
+         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         stride=(2, 2, 2, 2),
         enc_depths=(3, 3, 3, 12, 3),
         enc_channels=(48, 96, 192, 384, 512),
@@ -47,11 +48,11 @@ model = dict(
         use_quaternion_rpe=True,
         shared_context_operator=True,
         # Select: haar_wno, haar_wno_cnn, fno, or none.
-        context_operator="haar_wno_cnn",
+        context_operator="haar_wno",
         context_stages=(True, True, True, True),
-        context_channels=32,
-        context_grid_size=(32, 32, 32),
-        haar_levels=2,
+        context_channels=64,
+        context_grid_size=(64,64,64),
+        haar_levels=4,
         fno_modes=4,
         # Decoder-enabled configuration.
         use_decoder=True,
@@ -70,7 +71,7 @@ model = dict(
     ],
 )
 
-epoch = 1000
+epoch = 3000
 optimizer = dict(type='AdamW', lr=0.001, weight_decay=0.05)
 scheduler = dict(
     type='OneCycleLR',
@@ -156,7 +157,11 @@ data = dict(
                     feat_keys=("coord", "strength"),
                 ),
             ],
-                 aug_transform=[[{
-                          'type': 'RandomScale',
-                          'scale': [1.0, 1.0]
-                      }]])))
+            aug_transform=[
+
+                [dict(type="RandomScale", scale=[1, 1])],
+               
+            ],
+        ),
+    ),
+)

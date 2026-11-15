@@ -26,3 +26,6 @@ from .shapenet_part import ShapeNetPartDataset
 # dataloader
 from .dataloader import MultiDatasetDataloader
 from .sensaturban import SensatUrbanDataset
+
+from .so3_transforms import SO3Prepare, SO3IdentityPartition
+from .so3_block_dataset import SO3BlockDataset

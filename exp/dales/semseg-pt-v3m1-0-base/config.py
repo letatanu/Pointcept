@@ -1,7 +1,7 @@
 weight = 'exp/dales/semseg-pt-v3m1-0-base/model/model_best.pth'
 resume = False
 evaluate = True
-test_only = False
+test_only = True
 seed = 19163047
 save_path = 'exp/dales/semseg-pt-v3m1-0-base'
 num_worker = 24
@@ -200,54 +200,4 @@ data = dict(
                     keys=('coord', 'grid_coord', 'index'),
                     feat_keys=('coord', 'strength'))
             ],
-            aug_transform=[[{
-                'type': 'RandomScale',
-                'scale': [0.9, 0.9]
-            }], [{
-                'type': 'RandomScale',
-                'scale': [0.95, 0.95]
-            }], [{
-                'type': 'RandomScale',
-                'scale': [1, 1]
-            }], [{
-                'type': 'RandomScale',
-                'scale': [1.05, 1.05]
-            }], [{
-                'type': 'RandomScale',
-                'scale': [1.1, 1.1]
-            }],
-                           [{
-                               'type': 'RandomScale',
-                               'scale': [0.9, 0.9]
-                           }, {
-                               'type': 'RandomFlip',
-                               'p': 1
-                           }],
-                           [{
-                               'type': 'RandomScale',
-                               'scale': [0.95, 0.95]
-                           }, {
-                               'type': 'RandomFlip',
-                               'p': 1
-                           }],
-                           [{
-                               'type': 'RandomScale',
-                               'scale': [1, 1]
-                           }, {
-                               'type': 'RandomFlip',
-                               'p': 1
-                           }],
-                           [{
-                               'type': 'RandomScale',
-                               'scale': [1.05, 1.05]
-                           }, {
-                               'type': 'RandomFlip',
-                               'p': 1
-                           }],
-                           [{
-                               'type': 'RandomScale',
-                               'scale': [1.1, 1.1]
-                           }, {
-                               'type': 'RandomFlip',
-                               'p': 1
-                           }]])))
+            aug_transform=[[]])))

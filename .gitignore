@@ -20,3 +20,4 @@ Dockerfile
 ai
 mamba
 *.plytest-5080_54400_pred.ply
+pretrained

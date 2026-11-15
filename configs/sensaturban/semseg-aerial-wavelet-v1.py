@@ -3,10 +3,10 @@
 
 _base_ = ["../_base_/default_runtime.py"]
 
-batch_size = 2
-num_worker = 4
+batch_size = 8
+num_worker = 24
 mix_prob = 0.8
-empty_cache = False
+empty_cache = True
 empty_cache_per_epoch = True
 enable_amp = True
 amp_dtype = "bfloat16"
@@ -47,14 +47,14 @@ model = dict(
         drop_path=0.2,
         # Pairwise quaternion attention uses explicit attention bias.
         enable_flash=True,
-        use_quaternion_rpe=False,
-        shared_haar_wno=False,
+        use_quaternion_rpe=True,
+        shared_context_operator=True,
         # Select: haar_wno, haar_wno_cnn, fno, or none.
-        context_operator="haar_wno",
-        context_stages=(False, False, False, False),
+        context_operator="haar_wno_cnn",
+        context_stages=(True, True, True, True),
         context_channels=32,
         context_grid_size=(32, 32, 32),
-        haar_levels=3,
+        haar_levels=2,
         fno_modes=4,
         # Decoder-enabled configuration.
         use_decoder=True,
@@ -74,18 +74,15 @@ model = dict(
 )
 
 epoch = 1000
-eval_epoch = 100
-optimizer = dict(type="AdamW", lr=0.006, weight_decay=0.05)
-
+optimizer = dict(type='AdamW', lr=0.001, weight_decay=0.05)
 scheduler = dict(
-    type="OneCycleLR",
-    max_lr=[0.006, 0.0006],
+    type='OneCycleLR',
+    max_lr=[0.001, 0.0001],
     pct_start=0.05,
-    anneal_strategy="cos",
+    anneal_strategy='cos',
     div_factor=10.0,
-    final_div_factor=1000.0,
-)
-param_dicts = [dict(keyword="block", lr=0.0006)]
+    final_div_factor=1000.0)
+param_dicts = [dict(keyword='backbone', lr=0.0001)]
 
 dataset_type = "SensatUrbanDataset"
 data_root = "data/sensaturban/pointcept"
@@ -159,12 +156,7 @@ data = dict(
                 dict(type="Collect", keys=("coord", "grid_coord", "index"), 
                      feat_keys=("coord", "color")),
             ],
-            aug_transform=[
-                [dict(type="RandomScale", scale=[s, s])] for s in [0.9, 0.95, 1.0, 1.05, 1.1]
-            ] + [
-                [dict(type="RandomScale", scale=[s, s]), dict(type="RandomFlip", p=1)]
-                for s in [0.9, 0.95, 1.0, 1.05, 1.1]
-            ],
-        ),
-    ),
-)
+              aug_transform=[[{
+                'type': 'RandomScale',
+                'scale': [1.0, 1.0]
+            }]])))

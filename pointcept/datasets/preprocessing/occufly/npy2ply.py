@@ -1,16 +1,10 @@
-"""Export OccuFly voxel-center arrays to colored binary PLY for verification.
-
---mode verify exports semantic GT, camera RGB, and color-validity views.
-Validity colors: green = measured RGB available; magenta = unavailable.
-RGB is exported unchanged (unavailable colors normally zero/black).
-PLY vertices preserve training labels and, when present, color_valid.
-This exports points at voxel centers, not voxel cubes or reconstructed surfaces.
+"""Export OccuFly Pointcept predictions or ground truth to colored binary PLY.
 
 Standalone mode needs only NumPy. Optional --config-file mode requires Pointcept.
 Labels must use the 0..20 mapping from preprocess_occufly.py; -1 is ignore.
 
 Export predictions and ground truth together:
-python pointcept/datasets/preprocessing/occufly/npy2ply.py --dataset_root data/occufly/pointcept --split train --mode verify --output-dir data/occufly/viz
+python npy2ply_occufly.py --dataset_root "D:/OccuFly_Pointcept" --split val --mode both --result-dir "D:/Pointcept/exp/occufly/result"
 """
 
 import argparse
@@ -62,38 +56,17 @@ def validate_labels(labels, count):
     return labels.astype(np.int32), valid
 
 
-
-def validate_mask(mask, count):
-    mask = np.asarray(mask)
-    if mask.shape != (count,) or not np.isin(mask, [0, 1]).all():
-        raise ValueError(f"color_valid must have shape ({count},) with boolean or 0/1 values")
-    return mask.astype(bool)
-
-
-def write_ply(path, coord, labels, overwrite=False, colors=None, color_valid=None):
+def write_ply(path, coord, labels, overwrite=False):
     coord = np.asarray(coord)
     if coord.ndim != 2 or coord.shape[1] != 3 or not np.all(np.isfinite(coord)):
         raise ValueError("Coordinates must be finite with shape (N, 3)")
     labels, valid = validate_labels(labels, len(coord))
-    if colors is None:
-        colors = np.full((len(coord), 3), 128, dtype=np.uint8)
-        colors[valid] = COLOR_MAP[labels[valid]]
-    else:
-        colors = np.asarray(colors)
-        if colors.shape != (len(coord), 3) or not np.isfinite(colors).all():
-            raise ValueError("Colors must be finite with shape (N, 3)")
-        if np.any((colors < 0) | (colors > 255)):
-            raise ValueError("Expected RGB in 0..255, not normalized training features")
-        colors = np.rint(colors).astype(np.uint8)
-    if color_valid is not None:
-        color_valid = validate_mask(color_valid, len(coord))
-    fields = [
+    colors = np.full((len(coord), 3), 128, dtype=np.uint8)
+    colors[valid] = COLOR_MAP[labels[valid]]
+    vertex = np.empty(len(coord), dtype=[
         ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
         ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'), ('label', '<i4'),
-    ]
-    if color_valid is not None:
-        fields.append(('color_valid', 'u1'))
-    vertex = np.empty(len(coord), dtype=fields)
+    ])
     for i, axis in enumerate(('x', 'y', 'z')):
         vertex[axis] = coord[:, i]
         if not np.all(np.isfinite(vertex[axis])):
@@ -101,17 +74,13 @@ def write_ply(path, coord, labels, overwrite=False, colors=None, color_valid=Non
     for i, channel in enumerate(('red', 'green', 'blue')):
         vertex[channel] = colors[:, i]
     vertex['label'] = labels
-    if color_valid is not None:
-        vertex['color_valid'] = color_valid
     header = (
         'ply\nformat binary_little_endian 1.0\n'
-        'comment OccuFly voxel centers; label is training ID 0..20 or ignore -1\n'
+        'comment OccuFly training IDs 0..20; ignore -1 is gray\n'
         f'element vertex {len(coord)}\n'
         'property float x\nproperty float y\nproperty float z\n'
         'property uchar red\nproperty uchar green\nproperty uchar blue\n'
-        'property int label\n'
-        + ('property uchar color_valid\n' if color_valid is not None else '')
-        + 'end_header\n'
+        'property int label\nend_header\n'
     )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -139,22 +108,20 @@ def main():
     source.add_argument('--config-file', help='Pointcept config; run in your Pointcept environment')
     parser.add_argument('--options', nargs='+', help='Pointcept config overrides: key=value')
     parser.add_argument('--split', choices=('train', 'val', 'test'), default='val')
-    parser.add_argument('--mode', choices=('pred', 'gt', 'both', 'rgb', 'validity', 'verify'), default='pred')
+    parser.add_argument('--mode', choices=('pred', 'gt', 'both'), default='pred')
     result = parser.add_mutually_exclusive_group()
     result.add_argument('--result-dir', type=Path)
     result.add_argument('--exp-name', help='Uses exp/<exp-name>/result, matching your reference')
     parser.add_argument('--output_dir', '--output-dir', type=Path)
     parser.add_argument('--limit', type=int)
     parser.add_argument('--overwrite', action='store_true')
-    parser.add_argument('--valid-colors-only', action='store_true',
-                        help='Filter every exported view to points with color_valid=True')
     args = parser.parse_args()
     if args.limit is not None and args.limit < 1:
         parser.error('--limit must be positive')
     if args.options and not args.config_file:
         parser.error('--options requires --config-file')
     result_dir = args.result_dir or (Path('exp') / args.exp_name / 'result' if args.exp_name else None)
-    if args.mode in ('pred', 'both') and result_dir is None:
+    if args.mode != 'gt' and result_dir is None:
         parser.error('Prediction export requires --result-dir or --exp-name')
     output = args.output_dir or (result_dir / 'ply_viz' if result_dir else None)
     if output is None:
@@ -171,14 +138,7 @@ def main():
         dataset = build_dataset(cfg.data[args.split])
         # Iterate each original sample once and bypass all transforms.
         count = len(dataset.data_list)
-        def get_data(index):
-            data = dataset.get_data(index)
-            # Original dataset VALID_ASSETS may omit the new validity mask.
-            sample = Path(dataset.data_list[index])
-            for key in ('color', 'color_valid'):
-                if key not in data and (sample / f'{key}.npy').is_file():
-                    data[key] = np.load(sample / f'{key}.npy', allow_pickle=False)
-            return data
+        get_data = dataset.get_data
     else:
         samples = sorted(p.parent for p in (args.dataset_root / args.split).glob('*/coord.npy'))
         count = len(samples)
@@ -188,9 +148,6 @@ def main():
             data = {'name': sample.name, 'coord': np.load(sample / 'coord.npy', allow_pickle=False)}
             if args.mode != 'pred':
                 data['segment'] = np.load(sample / 'segment.npy', allow_pickle=False)
-            for key in ('color', 'color_valid'):
-                if (sample / f'{key}.npy').is_file():
-                    data[key] = np.load(sample / f'{key}.npy', allow_pickle=False)
             return data
 
     if count == 0:
@@ -203,30 +160,12 @@ def main():
             name = str(data['name'])
             if not name or name in ('.', '..') or any(c in name for c in '/\\:'):
                 raise ValueError(f'Invalid sample name: {name!r}')
-            kinds = ('gt', 'rgb', 'validity') if args.mode == 'verify' else (('gt', 'pred') if args.mode == 'both' else (args.mode,))
-            mask = data.get('color_valid')
-            if mask is not None:
-                mask = validate_mask(mask, len(data['coord']))
-                print(f'{name}: {int(mask.sum())}/{len(mask)} points have valid camera RGB ({100 * mask.mean() if len(mask) else 0:.2f}%)', flush=True)
-            if (args.mode in ('rgb', 'validity', 'verify') or args.valid_colors_only) and mask is None:
-                raise ValueError('Missing color_valid.npy; use the revised RGB preprocessor')
-            selection = mask if args.valid_colors_only else slice(None)
+            kinds = ('gt', 'pred') if args.mode == 'both' else (args.mode,)
             for kind in kinds:
                 try:
-                    labels = data['segment'] if kind != 'pred' else np.load(result_dir / f'{name}_pred.npy', allow_pickle=False)
-                    labels, _ = validate_labels(labels, len(data['coord']))
-                    colors = None
-                    if kind == 'rgb':
-                        colors = np.asarray(data['color'])
-                        if colors.shape != (len(data['coord']), 3) or not np.isfinite(colors).all() or np.any((colors < 0) | (colors > 255)):
-                            raise ValueError('Expected original color.npy: finite N x 3 RGB in 0..255')
-                    elif kind == 'validity':
-                        colors = np.where(mask[:, None], np.array([0, 200, 0]), np.array([255, 0, 255])).astype(np.uint8)
-                    suffix = '_valid_only' if args.valid_colors_only else ''
-                    path = output / f'{name}_{kind}{suffix}.ply'
-                    write_ply(path, data['coord'][selection], labels[selection], args.overwrite,
-                              colors=None if colors is None else colors[selection],
-                              color_valid=None if mask is None else mask[selection])
+                    labels = data['segment'] if kind == 'gt' else np.load(result_dir / f'{name}_pred.npy', allow_pickle=False)
+                    path = output / f'{name}_{kind}.ply'
+                    write_ply(path, data['coord'], labels, args.overwrite)
                     written += 1
                     print(f'[{index+1}/{count}] Saved {path}', flush=True)
                 except Exception as exc:

@@ -9,4 +9,5 @@
 # from .ptv3_no_lightweighthead_grid import *
 # from .ptv3_no_lightweighthead_enhanced_grid import *
 # from .ptv3_no_enhanced import *
-from .waveletnet import *
+# from .waveletnet import *
+from .point_transformer_v3m3_utonia import *

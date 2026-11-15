@@ -30,4 +30,16 @@ from .concerto import *
 from .optnet import *
 
 from .ptno import *
-from .so3_quaternion_transformer import *
+
+# from .so3_transformer import *
+from .point_transformer_v3 import *
+# from .CVPR import *
+# from .polar_quaternion_ptv3 import *
+# from .serialized_patch_pq import *
+# from .sparse_query_quatrope import *
+# from .cell_query_transformer import *
+# from .packed_hybrid_cell_query import *
+# from .hybrid_cell_query import *
+# from .serialized_local_cross import *
+# from .serialized_local_cross_v2 import *
+from .trisc import *
